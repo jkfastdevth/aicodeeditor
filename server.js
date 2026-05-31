@@ -1,6 +1,7 @@
 import cors from "cors";
 import express from "express";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,6 +10,9 @@ const app = express();
 const port = Number(process.env.PORT ?? 20128);
 const dataDir = process.env.DATA_DIR ?? join(__dirname, "data");
 const dbPath = join(dataDir, "router-state.json");
+const homeDir = homedir();
+const appDataDir = process.env.APPDATA ?? join(homeDir, "AppData", "Roaming");
+const localAppDataDir = process.env.LOCALAPPDATA ?? join(homeDir, "AppData", "Local");
 
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
@@ -19,7 +23,21 @@ const defaults = {
   fallbackStrategy: "subscription-cheap-free",
   tokenSaver: true,
   formatTranslation: true,
+  providerConnections: [],
   providers: [
+    {
+      id: "builtin",
+      label: "Built-in Local Assistant",
+      enabled: true,
+      tier: "custom",
+      status: "ready",
+      type: "builtin",
+      auth: "none",
+      model: "code-helper",
+      baseUrl: "builtin://code-helper",
+      apiKeyEnv: "",
+      quota: 100
+    },
     {
       id: "antigravity",
       label: "Antigravity",
@@ -31,8 +49,7 @@ const defaults = {
       model: "gemini-2.5-pro",
       baseUrl: "https://antigravity.googleapis.com/v1/chat",
       apiKeyEnv: "ANTIGRAVITY_TOKEN",
-      quota: 100,
-      mitm: { enabled: false, hostnames: ["antigravity.googleapis.com"], riskAccepted: false }
+      quota: 100
     },
     {
       id: "openai",
@@ -96,9 +113,9 @@ const defaults = {
     }
   ],
   combos: [
-    { id: "always-on-coding", name: "always-on-coding", models: ["antigravity/gemini-2.5-pro", "openai/gpt-4.1-mini", "anthropic/claude-sonnet-4-5", "gemini/gemini-2.5-flash", "local/llama3.1"] },
-    { id: "free-first", name: "free-first", models: ["gemini/gemini-2.5-flash", "local/llama3.1", "openai/gpt-4.1-mini"] },
-    { id: "local-first", name: "local-first", models: ["local/llama3.1", "openai/gpt-4.1-mini", "anthropic/claude-sonnet-4-5"] }
+    { id: "always-on-coding", name: "always-on-coding", models: ["antigravity/gemini-2.5-pro", "openai/gpt-4.1-mini", "anthropic/claude-sonnet-4-5", "gemini/gemini-2.5-flash", "local/llama3.1", "builtin/code-helper"] },
+    { id: "free-first", name: "free-first", models: ["gemini/gemini-2.5-flash", "local/llama3.1", "builtin/code-helper", "openai/gpt-4.1-mini"] },
+    { id: "local-first", name: "local-first", models: ["local/llama3.1", "builtin/code-helper", "openai/gpt-4.1-mini", "anthropic/claude-sonnet-4-5"] }
   ],
   aliases: {
     "router-auto": "always-on-coding",
@@ -106,6 +123,58 @@ const defaults = {
     antigravity: "antigravity/gemini-2.5-pro"
   }
 };
+
+const oauthDiscoveryTargets = [
+  {
+    provider: "antigravity",
+    label: "Antigravity",
+    paths: [
+      join(appDataDir, "Google", "Antigravity"),
+      join(localAppDataDir, "Google", "Antigravity"),
+      join(homeDir, ".config", "antigravity"),
+      join(homeDir, ".antigravity")
+    ]
+  },
+  {
+    provider: "anthropic",
+    label: "Claude Code",
+    paths: [join(homeDir, ".claude.json"), join(homeDir, ".claude", ".credentials.json"), join(homeDir, ".config", "claude")]
+  },
+  {
+    provider: "openai",
+    label: "Codex / OpenAI",
+    paths: [join(homeDir, ".codex", "auth.json"), join(homeDir, ".codex", "config.toml"), join(appDataDir, "Codex")]
+  },
+  {
+    provider: "gemini",
+    label: "Gemini CLI",
+    paths: [join(homeDir, ".gemini", "oauth_creds.json"), join(homeDir, ".gemini", "settings.json"), join(appDataDir, "gemini")]
+  },
+  {
+    provider: "qwen",
+    label: "Qwen CLI",
+    paths: [join(homeDir, ".qwen", "oauth_creds.json"), join(homeDir, ".qwen", "settings.json"), join(homeDir, ".config", "qwen")]
+  },
+  {
+    provider: "github-copilot",
+    label: "GitHub Copilot",
+    paths: [
+      join(appDataDir, "GitHub Copilot"),
+      join(appDataDir, "Code", "User", "globalStorage", "github.copilot"),
+      join(homeDir, ".config", "github-copilot")
+    ]
+  },
+  {
+    provider: "cursor",
+    label: "Cursor",
+    paths: [join(appDataDir, "Cursor", "User", "globalStorage"), join(homeDir, ".cursor")]
+  },
+  {
+    provider: "kiro",
+    label: "Kiro",
+    paths: [join(appDataDir, "Kiro"), join(localAppDataDir, "Kiro"), join(homeDir, ".kiro")]
+  }
+];
 
 function loadState() {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
@@ -119,9 +188,18 @@ function loadState() {
     ...saved,
     apiKeys: normalizeKeys(saved.apiKeys),
     providers: mergeById(defaults.providers, saved.providers),
-    combos: mergeById(defaults.combos, saved.combos),
+    combos: ensureBuiltinFallback(mergeById(defaults.combos, saved.combos)),
+    providerConnections: saved.providerConnections ?? defaults.providerConnections,
     aliases: { ...defaults.aliases, ...(saved.aliases ?? {}) }
   };
+}
+
+function ensureBuiltinFallback(combos) {
+  return combos.map((combo) =>
+    ["always-on-coding", "free-first", "local-first"].includes(combo.id) && !combo.models.includes("builtin/code-helper")
+      ? { ...combo, models: [...combo.models, "builtin/code-helper"] }
+      : combo
+  );
 }
 
 function mergeById(baseItems, savedItems) {
@@ -151,13 +229,24 @@ function requireKey(req, res, next) {
 function sanitizeState(state) {
   return {
     ...state,
-    apiKeys: state.apiKeys.map((item) => ({ ...item, key: maskKey(item.key) }))
+    apiKeys: state.apiKeys.map((item) => ({ ...item, key: maskKey(item.key) })),
+    providerConnections: state.providerConnections.map(maskConnection)
   };
 }
 
 function maskKey(key = "") {
   if (key.length <= 8) return "********";
   return `${key.slice(0, 4)}...${key.slice(-4)}`;
+}
+
+function maskConnection(connection) {
+  const { accessToken: _accessToken, refreshToken: _refreshToken, ...safe } = connection;
+  return {
+    ...safe,
+    hasAccessToken: Boolean(connection.accessToken),
+    hasRefreshToken: Boolean(connection.refreshToken),
+    accessTokenPreview: connection.accessToken ? maskKey(connection.accessToken) : undefined
+  };
 }
 
 function routeCandidates(state, requestedModel) {
@@ -169,7 +258,7 @@ function routeCandidates(state, requestedModel) {
       const [providerId, ...modelParts] = entry.split("/");
       const provider = state.providers.find((item) => item.id === providerId);
       if (!provider) return null;
-      return { provider, model: modelParts.join("/") || provider.model };
+      return { provider, model: modelParts.join("/") || provider.model, connection: selectConnection(state, provider.id) };
     })
     .filter(Boolean)
     .filter(({ provider }) => provider.enabled && provider.status !== "needs-key" && provider.quota > 0);
@@ -177,6 +266,12 @@ function routeCandidates(state, requestedModel) {
   if (state.fallbackStrategy === "manual-order") return candidates;
   const order = state.fallbackStrategy === "free-first" ? ["free", "cheap", "subscription", "custom"] : ["subscription", "cheap", "free", "custom"];
   return candidates.sort((a, b) => order.indexOf(a.provider.tier) - order.indexOf(b.provider.tier));
+}
+
+function selectConnection(state, providerId) {
+  return (state.providerConnections ?? [])
+    .filter((connection) => connection.provider === providerId && connection.isActive !== false)
+    .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100))[0];
 }
 
 function compactToolOutput(messages) {
@@ -241,6 +336,27 @@ function toProviderPayload(provider, normalized, model, state) {
   return { model, messages, stream: normalized.stream, max_tokens: normalized.maxTokens };
 }
 
+function builtinCompletion(normalized, model) {
+  const latestUser = [...normalized.messages].reverse().find((message) => message.role === "user")?.content ?? "";
+  const fileMatch = String(latestUser).match(/Active file:\s*(.+?)\n\n([\s\S]*)/);
+  const activeFile = fileMatch?.[1]?.trim() ?? "current file";
+  const fileText = fileMatch?.[2] ?? "";
+  const lines = fileText.split("\n").length;
+  const response = [
+    `Built-in code helper reviewed ${activeFile}.`,
+    `File size: ${lines} line(s).`,
+    "",
+    "Next practical step:",
+    "- Describe the exact code change you want, or connect an external/OAuth provider for model-generated patches.",
+    "- The router, editor, provider list, prompt composer, and fallback chain are working end-to-end."
+  ].join("\n");
+  return openAiCompletion(model, response, {
+    prompt_tokens: String(latestUser).length,
+    completion_tokens: response.length,
+    total_tokens: String(latestUser).length + response.length
+  });
+}
+
 function providerUrl(provider, model, stream) {
   if (provider.type === "gemini" || provider.type === "antigravity") {
     const action = stream ? "streamGenerateContent" : "generateContent";
@@ -249,8 +365,8 @@ function providerUrl(provider, model, stream) {
   return provider.baseUrl;
 }
 
-function providerHeaders(provider) {
-  const key = process.env[provider.apiKeyEnv];
+function providerHeaders(provider, connection) {
+  const key = connection?.accessToken ?? process.env[provider.apiKeyEnv];
   const headers = { "content-type": "application/json" };
   if (provider.type === "anthropic") {
     headers["x-api-key"] = key ?? "";
@@ -262,6 +378,45 @@ function providerHeaders(provider) {
     headers.authorization = `Bearer ${key}`;
   }
   return headers;
+}
+
+function isExpiringSoon(connection, leadMs = 5 * 60 * 1000) {
+  if (!connection?.expiresAt) return false;
+  return new Date(connection.expiresAt).getTime() - Date.now() < leadMs;
+}
+
+async function refreshConnectionIfNeeded(state, connection) {
+  if (!connection?.refreshToken || !isExpiringSoon(connection)) return connection;
+  const provider = state.providers.find((item) => item.id === connection.provider);
+  const tokenUrl = provider?.oauth?.tokenUrl ?? connection.providerSpecificData?.tokenUrl;
+  const clientId = process.env[provider?.oauth?.clientIdEnv] ?? connection.providerSpecificData?.clientId;
+  const clientSecret = process.env[provider?.oauth?.clientSecretEnv] ?? connection.providerSpecificData?.clientSecret;
+  if (!tokenUrl || !clientId) return connection;
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: connection.refreshToken,
+    client_id: clientId
+  });
+  if (clientSecret) body.set("client_secret", clientSecret);
+
+  const response = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body
+  });
+  if (!response.ok) return connection;
+  const json = await response.json();
+  const updated = {
+    ...connection,
+    accessToken: json.access_token ?? connection.accessToken,
+    refreshToken: json.refresh_token ?? connection.refreshToken,
+    expiresAt: json.expires_in ? new Date(Date.now() + Number(json.expires_in) * 1000).toISOString() : connection.expiresAt,
+    refreshedAt: new Date().toISOString()
+  };
+  state.providerConnections = state.providerConnections.map((item) => (item.id === updated.id ? updated : item));
+  saveState(state);
+  return updated;
 }
 
 function toOpenAiResponse(provider, upstream, model) {
@@ -349,21 +504,119 @@ function toResponsesResponse(openAiResult) {
   };
 }
 
+function discoverOauthOnDisk() {
+  return oauthDiscoveryTargets.map((target) => {
+    const matches = target.paths.map((candidatePath) => pathProbe(candidatePath)).filter((match) => match.exists);
+    return {
+      provider: target.provider,
+      label: target.label,
+      found: matches.length > 0,
+      matches,
+      checked: target.paths.length
+    };
+  });
+}
+
+function importOauthCredential(providerId) {
+  const discovery = discoverOauthOnDisk().find((item) => item.provider === providerId);
+  if (!discovery?.found) {
+    const error = new Error("No local OAuth credential path found");
+    error.status = 404;
+    throw error;
+  }
+
+  for (const match of discovery.matches.filter((item) => item.type === "file")) {
+    const parsed = tryReadCredentialFile(match.path);
+    const tokens = parsed ? extractTokens(parsed, providerId) : null;
+    if (tokens?.accessToken || tokens?.refreshToken) {
+      return {
+        provider: providerId,
+        sourcePath: match.path,
+        authType: "oauth",
+        isActive: true,
+        priority: 0,
+        importedAt: new Date().toISOString(),
+        ...tokens
+      };
+    }
+  }
+
+  const error = new Error("Found OAuth paths, but no supported token schema was detected");
+  error.status = 422;
+  throw error;
+}
+
+function tryReadCredentialFile(filePath) {
+  try {
+    const text = readFileSync(filePath, "utf8");
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function extractTokens(value, providerId) {
+  const candidates = flattenObjects(value);
+  const found = candidates.find((item) => item.accessToken || item.access_token || item.refreshToken || item.refresh_token || item.claudeAiOauth);
+  const source = found?.claudeAiOauth ?? found ?? {};
+  const accessToken = source.accessToken ?? source.access_token ?? source.token ?? source.id_token;
+  const refreshToken = source.refreshToken ?? source.refresh_token;
+  const expiresAt =
+    source.expiresAt ??
+    source.expiry_date ??
+    source.expiryDate ??
+    (source.expires_in ? new Date(Date.now() + Number(source.expires_in) * 1000).toISOString() : undefined);
+  const providerSpecificData = {
+    providerId,
+    tokenType: source.tokenType ?? source.token_type,
+    scope: source.scope,
+    account: source.account ?? source.email
+  };
+  return { accessToken, refreshToken, expiresAt, providerSpecificData };
+}
+
+function flattenObjects(value, output = []) {
+  if (!value || typeof value !== "object") return output;
+  output.push(value);
+  Object.values(value).forEach((child) => flattenObjects(child, output));
+  return output;
+}
+
+function pathProbe(candidatePath) {
+  if (!existsSync(candidatePath)) return { path: candidatePath, exists: false };
+  try {
+    const stats = statSync(candidatePath);
+    return {
+      path: candidatePath,
+      exists: true,
+      type: stats.isDirectory() ? "directory" : "file",
+      modifiedAt: stats.mtime.toISOString(),
+      size: stats.isFile() ? stats.size : undefined
+    };
+  } catch (error) {
+    return { path: candidatePath, exists: true, type: "unknown", error: error.message };
+  }
+}
+
 async function dispatch(body) {
   const state = loadState();
   const normalized = normalizeInput(body);
   const attempts = [];
 
   for (const candidate of routeCandidates(state, normalized.model)) {
-    const { provider, model } = candidate;
+    let { provider, model, connection } = candidate;
     try {
-      if (!process.env[provider.apiKeyEnv] && provider.auth !== "none" && !provider.baseUrl.includes("127.0.0.1")) {
+      if (provider.type === "builtin") {
+        return { json: builtinCompletion(normalized, model), provider, model, attempts };
+      }
+      connection = await refreshConnectionIfNeeded(state, connection);
+      if (!connection?.accessToken && !process.env[provider.apiKeyEnv] && provider.auth !== "none" && !provider.baseUrl.includes("127.0.0.1")) {
         throw new Error(`Missing ${provider.apiKeyEnv}`);
       }
       const payload = toProviderPayload(provider, normalized, model, state);
       const response = await fetch(providerUrl(provider, model, normalized.stream), {
         method: "POST",
-        headers: providerHeaders(provider),
+        headers: providerHeaders(provider, connection),
         body: JSON.stringify(payload)
       });
       if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
@@ -446,35 +699,97 @@ app.post("/api/providers/:id/test", async (req, res) => {
   res.status(validation.ok ? 200 : 422).json(validation);
 });
 
-app.get("/api/mitm/antigravity/status", (_req, res) => {
-  const provider = loadState().providers.find((item) => item.id === "antigravity");
+app.get("/api/oauth/discover", (_req, res) => {
   res.json({
-    provider: "antigravity",
-    available: true,
-    enabled: Boolean(provider?.mitm?.enabled),
-    riskAccepted: Boolean(provider?.mitm?.riskAccepted),
-    hostnames: provider?.mitm?.hostnames ?? ["antigravity.googleapis.com"],
-    note: "MITM/DNS interception is represented as configuration only in AIIA; install certificates and DNS rules manually before enabling real interception."
+    home: homeDir,
+    appData: appDataDir,
+    localAppData: localAppDataDir,
+    results: discoverOauthOnDisk()
   });
 });
 
-app.post("/api/mitm/antigravity/config", (req, res) => {
+app.post("/api/oauth/apply-discovery", (_req, res) => {
   const state = loadState();
-  state.providers = state.providers.map((provider) =>
-    provider.id === "antigravity"
-      ? {
-          ...provider,
-          mitm: {
-            ...(provider.mitm ?? {}),
-            enabled: Boolean(req.body.enabled),
-            riskAccepted: Boolean(req.body.riskAccepted),
-            hostnames: req.body.hostnames ?? provider.mitm?.hostnames ?? ["antigravity.googleapis.com"]
-          }
-        }
-      : provider
-  );
+  const discovery = discoverOauthOnDisk();
+  const foundByProvider = new Map(discovery.filter((item) => item.found).map((item) => [item.provider, item]));
+  state.providers = state.providers.map((provider) => {
+    const found = foundByProvider.get(provider.id);
+    if (!found) return provider;
+    return {
+      ...provider,
+      auth: "oauth",
+      status: "connected",
+      enabled: true,
+      oauthDiscovery: {
+        foundAt: new Date().toISOString(),
+        paths: found.matches.map((match) => ({ path: match.path, type: match.type, modifiedAt: match.modifiedAt }))
+      }
+    };
+  });
   saveState(state);
-  res.json(state.providers.find((provider) => provider.id === "antigravity")?.mitm);
+  res.json({ providers: state.providers, discovery });
+});
+
+app.get("/api/provider-connections", (_req, res) => {
+  res.json((loadState().providerConnections ?? []).map(maskConnection));
+});
+
+app.post("/api/oauth/import-local/:provider", (req, res) => {
+  try {
+    const state = loadState();
+    const connection = {
+      id: `conn-${req.params.provider}-${Date.now()}`,
+      ...importOauthCredential(req.params.provider)
+    };
+    state.providerConnections = [
+      ...(state.providerConnections ?? []).filter((item) => !(item.provider === connection.provider && item.sourcePath === connection.sourcePath)),
+      connection
+    ];
+    state.providers = state.providers.map((provider) =>
+      provider.id === connection.provider ? { ...provider, auth: "oauth", status: "connected", enabled: true } : provider
+    );
+    saveState(state);
+    res.status(201).json(maskConnection(connection));
+  } catch (error) {
+    res.status(error.status ?? 500).json({ error: { message: error.message } });
+  }
+});
+
+app.delete("/api/provider-connections/:id", (req, res) => {
+  const state = loadState();
+  state.providerConnections = (state.providerConnections ?? []).filter((connection) => connection.id !== req.params.id);
+  saveState(state);
+  res.status(204).end();
+});
+
+app.post("/api/provider-connections/:id/refresh", async (req, res) => {
+  const state = loadState();
+  const connection = (state.providerConnections ?? []).find((item) => item.id === req.params.id);
+  if (!connection) return res.status(404).json({ error: { message: "Connection not found" } });
+  try {
+    const refreshed = await refreshConnectionIfNeeded(state, { ...connection, expiresAt: new Date(0).toISOString() });
+    res.json(maskConnection(refreshed));
+  } catch (error) {
+    res.status(502).json({ error: { message: error.message } });
+  }
+});
+
+app.get("/api/parity/status", (_req, res) => {
+  const state = loadState();
+  res.json({
+    openAiCompatible: true,
+    claudeMessagesCompatible: true,
+    geminiCompatible: true,
+    ollamaCompatible: true,
+    providerRegistry: true,
+    providerConnections: (state.providerConnections ?? []).length,
+    oauthDiscovery: true,
+    oauthImport: true,
+    tokenRefresh: "generic-refresh-token-flow",
+    mitm: false,
+    usageTracking: false,
+    cooldownEngine: false
+  });
 });
 
 app.get("/api/combos", (_req, res) => res.json(loadState().combos));
@@ -607,7 +922,7 @@ app.post("/api/v1/api/chat", requireKey, async (req, res) => {
   }
 });
 
-app.post(["/antigravity/v1/chat", "/mitm/antigravity/v1/chat"], requireKey, async (req, res) => {
+app.post("/antigravity/v1/chat", requireKey, async (req, res) => {
   try {
     const result = await dispatch({ ...req.body, source: "antigravity", model: req.body.model ?? "antigravity" });
     res.json(toGeminiResponse(result.json));

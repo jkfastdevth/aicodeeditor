@@ -1,1056 +1,404 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  Braces,
-  Check,
-  Clipboard,
-  Download,
-  FileJson,
-  FileText,
-  GitBranch,
-  Import,
-  Network,
-  Plus,
-  RefreshCcw,
-  RotateCcw,
-  Trash2
-} from "lucide-react";
+import { Braces, Check, Clipboard, FileJson, FileText, GitBranch, Network, Plus, RefreshCcw, Save, Search, Settings } from "lucide-react";
 import "../styles.css";
 
-const storageKey = "aiia-context-editor:v4";
+const apiBase = "http://127.0.0.1:20128";
+const storageKey = "aiia-code-workspace:v1";
 
-const providers = [
-  {
-    id: "antigravity",
-    name: "Antigravity",
-    model: "gemini-2.5-pro",
-    context: "ide subscription",
-    note: "OAuth/MITM-style provider for Antigravity-compatible coding traffic."
-  },
-  {
-    id: "openrouter",
-    name: "OpenRouter",
-    model: "router auto",
-    context: "multi-provider",
-    note: "Default abstraction layer when models can be routed dynamically."
-  },
-  {
-    id: "openai",
-    name: "OpenAI",
-    model: "GPT family",
-    context: "tool aware",
-    note: "Strong fit for coding agents, tool execution, and structured output."
-  },
-  {
-    id: "anthropic",
-    name: "Anthropic",
-    model: "Claude family",
-    context: "long reasoning",
-    note: "Useful for review, planning, and careful refactor continuity."
-  },
-  {
-    id: "gemini",
-    name: "Gemini",
-    model: "Gemini family",
-    context: "large context",
-    note: "Good for wide repo scans, docs, and multimodal notes."
-  },
-  {
-    id: "local",
-    name: "Local LLM",
-    model: "Ollama / LM Studio",
-    context: "private",
-    note: "Best when privacy, offline work, or local routing matters."
-  }
-];
+const initialFiles = {
+  "src/main.ts": `type Provider = "openai" | "anthropic" | "gemini" | "local";
 
-const aiProviderCards = [
-  { id: "antigravity", name: "Antigravity", model: "gemini-2.5-pro", status: "ready", tier: "subscription" },
-  { id: "openai", name: "OpenAI", model: "gpt-4.1-mini", status: "ready", tier: "subscription" },
-  { id: "anthropic", name: "Anthropic", model: "claude-sonnet-4-5", status: "ready", tier: "subscription" },
-  { id: "gemini", name: "Gemini", model: "gemini-2.5-flash", status: "ready", tier: "free" },
-  { id: "local", name: "Local", model: "llama3.1", status: "ready", tier: "custom" },
-  { id: "openrouter", name: "OpenRouter", model: "openrouter/auto", status: "needs key", tier: "cheap" }
-];
+export async function askRouter(prompt: string) {
+  const response = await fetch("http://127.0.0.1:20128/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "always-on-coding",
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
 
-const taskPhases = ["prompt", "plan", "implement", "verify", "handoff"];
-
-const defaultState = {
-  sessionName: "AIIA portable session",
-  activeFile: "main",
-  activeProvider: "openrouter",
-  policy: "balanced",
-  options: {
-    includeCode: true,
-    includeMemory: true,
-    includeDiff: true
-  },
-  activeTask: {
-    prompt: "แก้ไขโค้ดตามคำสั่งผู้ใช้ โดยต้องทำงานต่อหลังสลับ provider ได้ทันที",
-    phase: "plan",
-    plan: [
-      { id: "understand", text: "Understand user request and preserve durable constraints.", done: true },
-      { id: "edit", text: "Edit code while recording decisions and current file state.", done: false },
-      { id: "verify", text: "Run checks and append results to the continuity packet.", done: false }
-    ],
-    implementation: "No code change started yet. Next provider should continue from the current editor files and plan state.",
-    currentStep: "edit",
-    resumeInstruction:
-      "Continue the active task without asking the user to restate context. Use task.prompt, task.plan, task.implementation, memory, turns, and files as the source of truth.",
-    switchEvents: []
-  },
-  router: {
-    mode: "standalone",
-    endpoint: "standalone://aiia-router/v1",
-    gatewayPath: "/v1/chat/completions",
-    apiKey: "local-dev-key",
-    selectedCombo: "always-on-coding",
-    fallbackStrategy: "subscription-cheap-free",
-    tokenSaver: true,
-    formatTranslation: true,
-    requestLogging: false,
-    quotaTracking: true,
-    providers: [
-      {
-        id: "antigravity",
-        label: "Antigravity",
-        auth: "oauth",
-        tier: "subscription",
-        status: "ready",
-        enabled: true,
-        model: "gemini-2.5-pro",
-        baseUrl: "https://antigravity.googleapis.com/v1/chat",
-        apiKeyEnv: "ANTIGRAVITY_TOKEN",
-        quota: 100,
-        context: "antigravity",
-        type: "antigravity",
-        mitm: { enabled: false, hostnames: ["antigravity.googleapis.com"], riskAccepted: false }
-      },
-      {
-        id: "cc",
-        label: "Claude Code",
-        auth: "oauth",
-        tier: "subscription",
-        status: "connected",
-        enabled: true,
-        model: "cc/claude-sonnet-4.5",
-        baseUrl: "https://api.anthropic.com/v1/messages",
-        apiKeyEnv: "ANTHROPIC_API_KEY",
-        quota: 76
-      },
-      {
-        id: "cx",
-        label: "Codex",
-        auth: "oauth",
-        tier: "subscription",
-        status: "ready",
-        enabled: true,
-        model: "cx/gpt-5.2-codex",
-        baseUrl: "https://api.openai.com/v1/chat/completions",
-        apiKeyEnv: "OPENAI_API_KEY",
-        quota: 64
-      },
-      {
-        id: "glm",
-        label: "GLM",
-        auth: "api-key",
-        tier: "cheap",
-        status: "needs-key",
-        enabled: true,
-        model: "glm/glm-5.1",
-        baseUrl: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        apiKeyEnv: "GLM_API_KEY",
-        quota: 100
-      },
-      {
-        id: "minimax",
-        label: "MiniMax",
-        auth: "api-key",
-        tier: "cheap",
-        status: "needs-key",
-        enabled: true,
-        model: "minimax/MiniMax-M2.7",
-        baseUrl: "https://api.minimax.io/v1/text/chatcompletion_v2",
-        apiKeyEnv: "MINIMAX_API_KEY",
-        quota: 100
-      },
-      {
-        id: "kr",
-        label: "Kiro AI",
-        auth: "oauth",
-        tier: "free",
-        status: "connected",
-        enabled: true,
-        model: "kr/claude-sonnet-4.5",
-        baseUrl: "https://kiro.local/oauth-proxy/chat",
-        apiKeyEnv: "KIRO_TOKEN",
-        quota: 42
-      },
-      {
-        id: "oc",
-        label: "OpenCode Free",
-        auth: "none",
-        tier: "free",
-        status: "connected",
-        enabled: true,
-        model: "oc/auto",
-        baseUrl: "https://opencode.local/free/chat",
-        apiKeyEnv: "OPENCODE_TOKEN",
-        quota: 35
-      },
-      {
-        id: "custom",
-        label: "Custom endpoint",
-        auth: "api-key",
-        tier: "custom",
-        status: "draft",
-        enabled: false,
-        model: "custom/model",
-        baseUrl: "https://provider.example.com/v1/chat/completions",
-        apiKeyEnv: "CUSTOM_PROVIDER_KEY",
-        quota: 100
-      }
-    ],
-    combos: [
-      {
-        id: "always-on-coding",
-        name: "always-on-coding",
-        models: ["antigravity/gemini-2.5-pro", "cc/claude-sonnet-4.5", "cx/gpt-5.2-codex", "glm/glm-5.1", "minimax/MiniMax-M2.7", "kr/claude-sonnet-4.5", "oc/auto"]
-      },
-      {
-        id: "free-first",
-        name: "free-first",
-        models: ["kr/claude-sonnet-4.5", "kr/glm-5", "oc/auto"]
-      },
-      {
-        id: "subscription-first",
-        name: "subscription-first",
-        models: ["cc/claude-sonnet-4.5", "cx/gpt-5.2-codex", "glm/glm-5.1"]
-      }
-    ]
-  },
-  files: {
-    main: `type Provider = "openrouter" | "openai" | "anthropic" | "gemini" | "local";
-
-interface ContextCapsule {
-  sessionId: string;
-  provider: Provider;
-  objective: string;
-  pinnedMemory: string[];
-  recentTurns: string[];
-  workingFiles: Record<string, string>;
-}
-
-export function buildPortablePrompt(capsule: ContextCapsule) {
-  return [
-    "# Continue this coding session",
-    \`Provider: \${capsule.provider}\`,
-    \`Objective: \${capsule.objective}\`,
-    "## Pinned memory",
-    capsule.pinnedMemory.join("\\n"),
-    "## Recent turns",
-    capsule.recentTurns.join("\\n"),
-    "## Working files",
-    JSON.stringify(capsule.workingFiles, null, 2)
-  ].join("\\n\\n");
+  return response.json();
 }`,
-    notes: `# Agent continuity notes
+  "README.md": `# AIIA Code Workspace
 
-- Store decisions as memory blocks, not hidden chat history.
-- Before switching providers, create a normalized handoff package.
-- Keep provider-specific prompts thin; keep product state in the capsule.
-- Import a previous handoff to resume with a different model.`,
-    handoff: ""
-  },
-  memory: [
+Local code editor backed by a standalone AI router.
+
+- Edit files in the center editor
+- Pick a router model/provider on the right
+- Send prompts from the composer
+- Inspect router output in the bottom panel`,
+  "router.config.json": JSON.stringify(
     {
-      title: "Objective",
-      body: "Build a React code editor that keeps AI agent context portable when switching between OpenRouter-like providers.",
-      pinned: true
+      baseUrl: "http://127.0.0.1:20128/v1",
+      model: "always-on-coding"
     },
-    {
-      title: "Architecture",
-      body: "Use a provider-agnostic Context Capsule containing session goal, pinned memory, recent turns, active files, and switch policy.",
-      pinned: true
-    }
-  ],
-  turns: [
-    {
-      at: new Date().toISOString(),
-      text: "Initial session created. User needs cross-provider AI agent continuity."
-    }
-  ]
+    null,
+    2
+  )
 };
 
-const files = [
-  { id: "main", label: "main.ts", icon: Braces },
-  { id: "notes", label: "agent-notes.md", icon: FileText },
-  { id: "handoff", label: "handoff.json", icon: FileJson }
-];
-
-function loadState() {
-  const raw = localStorage.getItem(storageKey);
-  if (!raw) return structuredClone(defaultState);
+function loadWorkspace() {
   try {
-    return mergeState(structuredClone(defaultState), JSON.parse(raw));
+    return JSON.parse(localStorage.getItem(storageKey)) ?? { activeFile: "src/main.ts", files: initialFiles };
   } catch {
-    return structuredClone(defaultState);
+    return { activeFile: "src/main.ts", files: initialFiles };
   }
-}
-
-function mergeState(base, saved) {
-  return {
-    ...base,
-    ...saved,
-    options: { ...base.options, ...(saved.options ?? {}) },
-    files: { ...base.files, ...(saved.files ?? {}) },
-    activeTask: {
-      ...base.activeTask,
-      ...(saved.activeTask ?? {}),
-      plan: saved.activeTask?.plan ?? base.activeTask.plan,
-      switchEvents: saved.activeTask?.switchEvents ?? base.activeTask.switchEvents
-    },
-    router: {
-      ...base.router,
-      ...(saved.router ?? {}),
-      providers: mergeProviders(base.router.providers, saved.router?.providers),
-      combos: saved.router?.combos ?? base.router.combos
-    }
-  };
-}
-
-function mergeProviders(baseProviders, savedProviders) {
-  if (!savedProviders) return baseProviders;
-  return baseProviders.map((baseProvider) => ({
-    ...baseProvider,
-    ...(savedProviders.find((item) => item.id === baseProvider.id) ?? {})
-  }));
-}
-
-function toUiProvider(provider) {
-  return {
-    auth: provider.auth ?? (provider.type === "openai" ? "api-key" : "api-key"),
-    ...provider,
-    context: provider.type ?? "openai"
-  };
-}
-
-function toBackendProvider(provider) {
-  const { context: _context, ...rest } = provider;
-  return rest;
 }
 
 function App() {
-  const [state, setState] = useState(loadState);
-  const [copied, setCopied] = useState(false);
-  const [backendStatus, setBackendStatus] = useState("local");
   const [page, setPage] = useState("editor");
+  const [workspace, setWorkspace] = useState(loadWorkspace);
+  const [savedFiles, setSavedFiles] = useState(workspace.files);
+  const [providers, setProviders] = useState([]);
+  const [combos, setCombos] = useState([]);
+  const [connections, setConnections] = useState([]);
+  const [selectedModel, setSelectedModel] = useState("always-on-coding");
+  const [selectedProvider, setSelectedProvider] = useState("openai");
+  const [backendStatus, setBackendStatus] = useState("checking");
+  const [prompt, setPrompt] = useState("");
+  const [isSending, setIsSending] = useState(false);
+  const [bottomTab, setBottomTab] = useState("terminal");
+  const [output, setOutput] = useState(["AIIA workspace ready"]);
+  const [problems, setProblems] = useState([]);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [cursor, setCursor] = useState({ line: 1, column: 1, selection: 0 });
+  const editorRef = useRef(null);
 
-  const provider = useMemo(
-    () => providers.find((item) => item.id === state.activeProvider) ?? providers[0],
-    [state.activeProvider]
-  );
-
-  const handoff = useMemo(() => buildHandoff(state, provider), [state, provider]);
-  const activeText = state.activeFile === "handoff" ? JSON.stringify(handoff, null, 2) : state.files[state.activeFile] ?? "";
-
-  const lineNumbers = useMemo(() => {
-    const count = Math.max(1, activeText.split("\n").length);
-    return Array.from({ length: count }, (_, index) => index + 1).join("\n");
-  }, [activeText]);
-
-  const contextScore = useMemo(() => {
-    const pinned = state.memory.filter((item) => item.pinned).length;
-    return Math.min(100, 25 + pinned * 20 + Math.min(state.turns.length, 5) * 7 + (state.options.includeCode ? 10 : 0));
-  }, [state.memory, state.options.includeCode, state.turns.length]);
+  const activeText = workspace.files[workspace.activeFile] ?? "";
+  const dirtyFiles = useMemo(() => Object.keys(workspace.files).filter((file) => workspace.files[file] !== savedFiles[file]), [savedFiles, workspace.files]);
+  const findMatches = useMemo(() => (findQuery ? activeText.match(new RegExp(escapeRegExp(findQuery), "gi"))?.length ?? 0 : 0), [activeText, findQuery]);
+  const activeProvider = providers.find((provider) => provider.id === selectedProvider) ?? providers[0];
 
   useEffect(() => {
-    localStorage.setItem(storageKey, JSON.stringify(state));
-  }, [state]);
+    localStorage.setItem(storageKey, JSON.stringify(workspace));
+  }, [workspace]);
 
   useEffect(() => {
-    loadBackendRouter();
+    refreshBackend();
   }, []);
 
-  function patchState(patch) {
-    setState((current) => ({ ...current, ...patch }));
-  }
+  useEffect(() => {
+    const nextProblems = [];
+    if (backendStatus !== "online") nextProblems.push("Backend router is offline or not reachable.");
+    if (dirtyFiles.length) nextProblems.push(`${dirtyFiles.length} file(s) have unsaved changes.`);
+    if (!providers.length) nextProblems.push("No providers loaded from backend.");
+    setProblems(nextProblems);
+  }, [backendStatus, dirtyFiles.length, providers.length]);
 
-  function addTurn(text) {
-    setState((current) => ({
-      ...current,
-      turns: [...current.turns, { at: new Date().toISOString(), text }]
-    }));
-  }
-
-  function switchProvider(nextProvider, mode = "manual") {
-    setState((current) => ({
-      ...current,
-      activeProvider: nextProvider.id,
-      activeTask: {
-        ...current.activeTask,
-        switchEvents: [
-          ...current.activeTask.switchEvents,
-          {
-            at: new Date().toISOString(),
-            mode,
-            from: current.activeProvider,
-            to: nextProvider.id,
-            phase: current.activeTask.phase,
-            currentStep: current.activeTask.currentStep,
-            reason: mode === "auto" ? "Provider limit reached; continuity packet routed to fallback provider." : "Manual provider switch."
-          }
-        ]
-      },
-      turns: [
-        ...current.turns,
-        {
-          at: new Date().toISOString(),
-          text: `${mode === "auto" ? "Auto" : "Manual"} switched active provider to ${nextProvider.name} with ${current.policy} policy. Active task phase preserved: ${current.activeTask.phase}.`
-        }
-      ]
-    }));
-  }
-
-  function updateActiveTask(patch) {
-    setState((current) => ({
-      ...current,
-      activeTask: { ...current.activeTask, ...patch }
-    }));
-  }
-
-  function updatePlanItem(index, patch) {
-    setState((current) => ({
-      ...current,
-      activeTask: {
-        ...current.activeTask,
-        plan: current.activeTask.plan.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item))
-      }
-    }));
-  }
-
-  function addPlanItem() {
-    setState((current) => ({
-      ...current,
-      activeTask: {
-        ...current.activeTask,
-        plan: [...current.activeTask.plan, { id: `step-${current.activeTask.plan.length + 1}`, text: "Describe the next implementation step.", done: false }]
-      }
-    }));
-  }
-
-  function autoSwitchProvider() {
-    const currentIndex = providers.findIndex((item) => item.id === state.activeProvider);
-    const nextProvider = providers[(currentIndex + 1) % providers.length];
-    switchProvider(nextProvider, "auto");
-  }
-
-  function updateMemory(index, patch) {
-    setState((current) => ({
-      ...current,
-      memory: current.memory.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item))
-    }));
-  }
-
-  function removeMemory(index) {
-    setState((current) => ({
-      ...current,
-      memory: current.memory.filter((_, itemIndex) => itemIndex !== index)
-    }));
-  }
-
-  async function copyHandoff() {
-    await navigator.clipboard.writeText(JSON.stringify(handoff, null, 2));
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1200);
-  }
-
-  function exportHandoff() {
-    const blob = new Blob([JSON.stringify(handoff, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${state.sessionName.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "aiia"}-handoff.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-  }
-
-  async function importHandoff(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const imported = JSON.parse(await file.text());
-    setState((current) => ({
-      ...current,
-      sessionName: imported.sessionName ?? current.sessionName,
-      activeProvider: imported.route?.provider ?? current.activeProvider,
-      policy: imported.route?.policy ?? current.policy,
-      router: imported.router ?? current.router,
-      activeTask: imported.task ?? imported.activeTask ?? current.activeTask,
-      memory: imported.continuity?.pinnedMemory ?? current.memory,
-      turns: imported.continuity?.recentTurns ?? current.turns,
-      files: { ...current.files, ...(imported.files ?? {}) }
-    }));
-    event.target.value = "";
-  }
-
-  function updateRouter(patch) {
-    setState((current) => ({
-      ...current,
-      router: { ...current.router, ...patch }
-    }));
-  }
-
-  function updateRouterProvider(index, patch) {
-    setState((current) => ({
-      ...current,
-      router: {
-        ...current.router,
-        providers: current.router.providers.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item))
-      }
-    }));
-  }
-
-  async function loadBackendRouter() {
+  async function refreshBackend() {
     try {
-      const [providersResponse, combosResponse] = await Promise.all([
-        fetch("http://127.0.0.1:20128/api/providers"),
-        fetch("http://127.0.0.1:20128/api/combos")
+      const [providerRes, comboRes, connectionRes, parityRes] = await Promise.all([
+        fetch(`${apiBase}/api/providers`),
+        fetch(`${apiBase}/api/combos`),
+        fetch(`${apiBase}/api/provider-connections`),
+        fetch(`${apiBase}/api/parity/status`)
       ]);
-      if (!providersResponse.ok || !combosResponse.ok) throw new Error("backend unavailable");
-      const [backendProviders, backendCombos] = await Promise.all([providersResponse.json(), combosResponse.json()]);
-      setState((current) => ({
-        ...current,
-        router: {
-          ...current.router,
-          endpoint: "http://127.0.0.1:20128/v1",
-          gatewayPath: "/v1/chat/completions",
-          providers: mergeProviders(defaultState.router.providers, backendProviders.map(toUiProvider)),
-          combos: backendCombos
-        }
-      }));
-      setBackendStatus("synced");
-    } catch {
-      setBackendStatus("local");
+      if (!providerRes.ok || !comboRes.ok || !parityRes.ok) throw new Error("backend unavailable");
+      setProviders(await providerRes.json());
+      setCombos(await comboRes.json());
+      setConnections(connectionRes.ok ? await connectionRes.json() : []);
+      setBackendStatus("online");
+      setOutput((current) => [`Backend online: ${apiBase}`, ...current].slice(0, 12));
+    } catch (error) {
+      setBackendStatus("offline");
+      setOutput((current) => [`Backend check failed: ${error.message}`, ...current].slice(0, 12));
     }
   }
 
-  async function saveBackendProviders() {
+  function updateActiveFile(value) {
+    setWorkspace((current) => ({
+      ...current,
+      files: { ...current.files, [current.activeFile]: value }
+    }));
+  }
+
+  function saveActiveFile() {
+    setSavedFiles((current) => ({ ...current, [workspace.activeFile]: activeText }));
+    setOutput((current) => [`Saved ${workspace.activeFile}`, ...current].slice(0, 12));
+  }
+
+  function addFile() {
+    const name = `src/new-file-${Object.keys(workspace.files).length + 1}.ts`;
+    setWorkspace((current) => ({ activeFile: name, files: { ...current.files, [name]: "" } }));
+  }
+
+  function updateCursor(target) {
+    const before = target.value.slice(0, target.selectionStart);
+    const lines = before.split("\n");
+    setCursor({ line: lines.length, column: lines.at(-1).length + 1, selection: Math.abs(target.selectionEnd - target.selectionStart) });
+  }
+
+  async function sendPrompt(event) {
+    event.preventDefault();
+    if (!prompt.trim()) return;
+    setIsSending(true);
+    setBottomTab("output");
+    const context = `Active file: ${workspace.activeFile}\n\n${activeText}`;
     try {
-      const response = await fetch("http://127.0.0.1:20128/api/providers", {
-        method: "PUT",
+      const response = await fetch(`${apiBase}/v1/chat/completions`, {
+        method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ providers: state.router.providers.map(toBackendProvider) })
+        body: JSON.stringify({
+          model: selectedModel,
+          messages: [
+            { role: "system", content: "You are helping edit code. Return concise, actionable guidance or a patch description." },
+            { role: "user", content: `${prompt}\n\n${context}` }
+          ]
+        })
       });
-      if (!response.ok) throw new Error("save failed");
-      setBackendStatus("saved");
-      window.setTimeout(() => setBackendStatus("synced"), 1200);
-    } catch {
-      setBackendStatus("local");
+      const json = await response.json();
+      const text = json.choices?.[0]?.message?.content ?? JSON.stringify(json, null, 2);
+      setOutput((current) => [`> ${prompt}`, text, ...current].slice(0, 12));
+      setPrompt("");
+    } catch (error) {
+      setOutput((current) => [`Router request failed: ${error.message}`, ...current].slice(0, 12));
+    } finally {
+      setIsSending(false);
     }
   }
 
   if (page === "providers") {
     return (
       <ProvidersPage
-        router={state.router}
+        providers={providers}
+        connections={connections}
         backendStatus={backendStatus}
         onBack={() => setPage("editor")}
-        onUpdate={updateRouter}
-        onUpdateProvider={updateRouterProvider}
-        onLoadBackend={loadBackendRouter}
-        onSaveBackend={saveBackendProviders}
+        onRefresh={refreshBackend}
+        onOutput={(line) => setOutput((current) => [line, ...current].slice(0, 12))}
       />
     );
   }
 
   return (
-    <main className="app-shell">
-      <aside className="rail explorer-rail" aria-label="Code explorer">
-        <div className="brand">
-          <div className="mark" aria-hidden="true">
-            AI
-          </div>
-          <div>
-            <h1>AIIA Code Workspace</h1>
-            <p>AI-assisted code editing with portable task context</p>
-          </div>
-        </div>
-        <nav className="app-nav" aria-label="Application views">
-          <button className="active" onClick={() => setPage("editor")}>Editor</button>
-          <button onClick={() => setPage("providers")}>Providers</button>
-        </nav>
-
-        <section className="panel explorer-panel">
-          <div className="section-head">
-            <h2>Explorer</h2>
-            <button className="icon-button" title="New file" aria-label="New file">
-              <Plus size={17} />
-            </button>
-          </div>
-          <div className="file-tree">
-            <div className="folder-row">AIIA / src</div>
-            {files.map((file) => {
-              const Icon = file.icon;
-              return (
-                <button
-                  className={`file-row ${state.activeFile === file.id ? "active" : ""}`}
-                  key={file.id}
-                  onClick={() => patchState({ activeFile: file.id })}
-                >
-                  <Icon size={15} />
-                  <span>{file.label}</span>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="panel session-panel compact-panel">
-          <div className="section-head">
-            <h2>Session Ledger</h2>
-            <button
-              className="icon-button"
-              title="New session"
-              aria-label="New session"
-              onClick={() => setState({ ...structuredClone(defaultState), sessionName: `AIIA session ${new Date().toLocaleDateString()}` })}
-            >
-              <RotateCcw size={17} />
-            </button>
-          </div>
-          <label className="field">
-            <span>Session name</span>
-            <input value={state.sessionName} onChange={(event) => patchState({ sessionName: event.target.value })} />
-          </label>
-          <div className="metrics">
-            <Metric value={state.turns.length} label="turns" />
-            <Metric value={state.memory.length} label="memory" />
-            <Metric value={`${contextScore}%`} label="ready" />
-          </div>
-        </section>
-
-        <section className="panel compact-panel">
-          <div className="section-head">
-            <h2>Memory Blocks</h2>
-            <button
-              className="icon-button"
-              title="Add memory block"
-              aria-label="Add memory block"
-              onClick={() =>
-                patchState({
-                  memory: [...state.memory, { title: "New memory", body: "Describe a durable decision or constraint.", pinned: true }]
-                })
-              }
-            >
-              <Plus size={18} />
-            </button>
-          </div>
-          <div className="memory-list">
-            {state.memory.map((item, index) => (
-              <article className="memory-card" key={`${item.title}-${index}`}>
-                <input className="memory-title" value={item.title} onChange={(event) => updateMemory(index, { title: event.target.value })} />
-                <textarea className="memory-body" value={item.body} onChange={(event) => updateMemory(index, { body: event.target.value })} />
-                <div className="card-actions">
-                  <label>
-                    <input type="checkbox" checked={item.pinned} onChange={(event) => updateMemory(index, { pinned: event.target.checked })} />
-                    pinned
-                  </label>
-                  <button type="button" className="remove-memory" onClick={() => removeMemory(index)}>
-                    <Trash2 size={14} />
-                    Remove
-                  </button>
-                </div>
-              </article>
-            ))}
-          </div>
-        </section>
+    <main className="code-app">
+      <aside className="activity-bar">
+        <button className="active" title="Explorer"><FileText size={20} /></button>
+        <button title="Search" onClick={() => setFindOpen((value) => !value)}><Search size={20} /></button>
+        <button title="Providers"><Network size={20} /></button>
+        <button title="Settings" onClick={() => setPage("providers")}><Settings size={20} /></button>
       </aside>
 
-      <section className="workspace" aria-label="Code workspace">
-        <TaskContinuityPanel
-          task={state.activeTask}
-          onUpdate={updateActiveTask}
-          onUpdatePlanItem={updatePlanItem}
-          onAddPlanItem={addPlanItem}
-          onAutoSwitch={autoSwitchProvider}
-        />
+      <aside className="explorer-pane">
+        <div className="pane-head">
+          <strong>Explorer</strong>
+          <button onClick={addFile} title="New file"><Plus size={16} /></button>
+        </div>
+        <div className="file-tree">
+          {Object.keys(workspace.files).map((file) => (
+            <button className={`file-row ${workspace.activeFile === file ? "active" : ""}`} key={file} onClick={() => setWorkspace((current) => ({ ...current, activeFile: file }))}>
+              {file.endsWith(".json") ? <FileJson size={15} /> : file.endsWith(".md") ? <FileText size={15} /> : <Braces size={15} />}
+              <span>{dirtyFiles.includes(file) ? `${file} *` : file}</span>
+            </button>
+          ))}
+        </div>
+      </aside>
 
-        <div className="topbar">
-          <div className="tabs" role="tablist" aria-label="Editor files">
-            {files.map((file) => {
-              const Icon = file.icon;
-              return (
-                <button
-                  className={`tab ${state.activeFile === file.id ? "active" : ""}`}
-                  key={file.id}
-                  onClick={() => patchState({ activeFile: file.id })}
-                >
-                  <Icon size={15} />
-                  {file.label}
-                </button>
-              );
-            })}
+      <section className="editor-pane">
+        <header className="editor-titlebar">
+          <div className="tabs">
+            <button className="tab active">{workspace.activeFile}</button>
           </div>
           <div className="toolbar">
-            <button onClick={copyHandoff}>
-              {copied ? <Check size={15} /> : <Clipboard size={15} />}
-              {copied ? "Copied" : "Copy handoff"}
-            </button>
-            <button onClick={exportHandoff}>
-              <Download size={15} />
-              Export
-            </button>
-            <label className="import-button">
-              <Import size={15} />
-              Import
-              <input type="file" accept="application/json,.json" onChange={importHandoff} />
-            </label>
+            <button onClick={() => setFindOpen((value) => !value)}><Search size={15} />Find</button>
+            <button onClick={saveActiveFile}><Save size={15} />Save</button>
+            <button onClick={refreshBackend}><RefreshCcw size={15} />Router</button>
           </div>
-        </div>
+        </header>
+
+        {findOpen ? (
+          <div className="find-bar">
+            <input value={findQuery} onChange={(event) => setFindQuery(event.target.value)} placeholder="Find in current file" autoFocus />
+            <span>{findMatches} matches</span>
+            <button onClick={() => setFindOpen(false)}>Close</button>
+          </div>
+        ) : null}
 
         <div className="editor-wrap">
-          <div className="gutter" aria-hidden="true">
-            {lineNumbers}
-          </div>
+          <pre className="gutter">{lineNumbers(activeText)}</pre>
           <textarea
+            ref={editorRef}
             className="code-editor"
             spellCheck="false"
             value={activeText}
-            onKeyDown={(event) => {
-              if (event.key !== "Tab" || state.activeFile === "handoff") return;
-              event.preventDefault();
-              const target = event.currentTarget;
-              const start = target.selectionStart;
-              const end = target.selectionEnd;
-              const value = `${target.value.slice(0, start)}  ${target.value.slice(end)}`;
-              patchState({ files: { ...state.files, [state.activeFile]: value } });
-              requestAnimationFrame(() => {
-                target.selectionStart = target.selectionEnd = start + 2;
-              });
-            }}
             onChange={(event) => {
-              if (state.activeFile === "handoff") return;
-              patchState({ files: { ...state.files, [state.activeFile]: event.target.value } });
+              updateActiveFile(event.target.value);
+              updateCursor(event.currentTarget);
+            }}
+            onClick={(event) => updateCursor(event.currentTarget)}
+            onKeyUp={(event) => updateCursor(event.currentTarget)}
+            onKeyDown={(event) => {
+              if (event.key === "Tab") {
+                event.preventDefault();
+                const target = event.currentTarget;
+                const start = target.selectionStart;
+                const end = target.selectionEnd;
+                updateActiveFile(`${target.value.slice(0, start)}  ${target.value.slice(end)}`);
+                requestAnimationFrame(() => {
+                  target.selectionStart = target.selectionEnd = start + 2;
+                  updateCursor(target);
+                });
+              }
             }}
           />
         </div>
 
-        <section className="context-strip" aria-label="Active context">
-          <div>
-            <h2>Active Context Capsule</h2>
-            <p>
-              {provider.name} receives {handoff.continuity.pinnedMemory.length} pinned memory blocks, {handoff.continuity.recentTurns.length} recent
-              turns, and {Object.keys(handoff.files).length} files.
-            </p>
+        <form className="prompt-composer" onSubmit={sendPrompt}>
+          <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Ask the router to explain, refactor, or patch the current file" />
+          <div className="composer-actions">
+            <span>{selectedModel}</span>
+            <button disabled={isSending || backendStatus !== "online"} type="submit">{isSending ? "Sending..." : "Send"}</button>
           </div>
-          <div className="capsule-tags">
-            {[state.policy, provider.context, state.options.includeCode ? "code attached" : "memory only"].map((tag) => (
-              <span className="tag" key={tag}>
-                {tag}
-              </span>
+        </form>
+
+        <section className="bottom-panel">
+          <div className="bottom-tabs">
+            {["terminal", "problems", "output"].map((tab) => (
+              <button className={bottomTab === tab ? "active" : ""} key={tab} onClick={() => setBottomTab(tab)}>{capitalize(tab)}</button>
             ))}
           </div>
+          <BottomPanel tab={bottomTab} output={output} problems={problems} backendStatus={backendStatus} selectedModel={selectedModel} activeProvider={activeProvider} dirtyFiles={dirtyFiles} />
         </section>
-        <PromptComposer
-          task={state.activeTask}
-          onUpdate={updateActiveTask}
-          onSubmit={(prompt) => {
-            updateActiveTask({ prompt, phase: "plan" });
-            addTurn(`User prompt queued: ${prompt}`);
-          }}
-        />
+
+        <footer className="status-bar">
+          <span><GitBranch size={13} /> master</span>
+          <span>{dirtyFiles.length ? `${dirtyFiles.length} unsaved` : "saved"}</span>
+          <span>Ln {cursor.line}, Col {cursor.column}{cursor.selection ? ` (${cursor.selection} selected)` : ""}</span>
+          <span>{languageFor(workspace.activeFile)}</span>
+          <span>{backendStatus}</span>
+        </footer>
       </section>
 
-      <aside className="side ai-rail" aria-label="AI provider selection">
-        <section className="panel ai-provider-panel">
-          <div className="section-head">
-            <h2>AI Providers</h2>
-            <span className="status-pill">{provider.name}</span>
-          </div>
-          <div className="ai-list">
-            {aiProviderCards.map((item) => (
-              <button
-                className={`ai-row ${item.id === state.activeProvider ? "active" : ""}`}
-                type="button"
-                key={item.id}
-                onClick={() => switchProvider(providers.find((providerItem) => providerItem.id === item.id) ?? providers[0])}
-              >
-                <div>
-                  <strong>{item.name}</strong>
-                  <small>{item.model}</small>
-                </div>
-                <span>{item.status}</span>
-              </button>
-            ))}
-          </div>
-          <button className="wide-button" onClick={() => setPage("providers")}>Configure OAuth providers</button>
-        </section>
-
-        <section className="panel">
-          <h2>Switch Policy</h2>
-          <div className="segmented" role="group" aria-label="Switch policy">
-            {[
-              ["balanced", "Balanced"],
-              ["cheap", "Cost"],
-              ["long", "Long context"]
-            ].map(([id, label]) => (
-              <button className={state.policy === id ? "active" : ""} key={id} onClick={() => patchState({ policy: id })}>
-                {label}
-              </button>
-            ))}
-          </div>
-          <CheckRow
-            checked={state.options.includeCode}
-            label="Attach current code"
-            onChange={(checked) => patchState({ options: { ...state.options, includeCode: checked } })}
-          />
-          <CheckRow
-            checked={state.options.includeMemory}
-            label="Attach pinned memory"
-            onChange={(checked) => patchState({ options: { ...state.options, includeMemory: checked } })}
-          />
-          <CheckRow
-            checked={state.options.includeDiff}
-            label="Attach working diff summary"
-            onChange={(checked) => patchState({ options: { ...state.options, includeDiff: checked } })}
-          />
-        </section>
-
-        <section className="panel handoff-panel">
-          <div className="section-head">
-            <h2>Handoff Preview</h2>
-            <button className="icon-button" title="Refresh preview" aria-label="Refresh preview" onClick={() => patchState({ files: { ...state.files } })}>
-              <RefreshCcw size={16} />
+      <aside className="router-pane">
+        <div className="pane-head">
+          <strong>Router</strong>
+          <span className={`status-pill ${backendStatus}`}>{backendStatus}</span>
+        </div>
+        <label className="field">
+          <span>Model / Combo</span>
+          <select value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)}>
+            {combos.map((combo) => <option value={combo.name} key={combo.id}>{combo.name}</option>)}
+            {providers.map((provider) => <option value={`${provider.id}/${provider.model}`} key={provider.id}>{provider.id}/{provider.model}</option>)}
+          </select>
+        </label>
+        <div className="ai-list">
+          {providers.map((provider) => (
+            <button className={`ai-row ${selectedProvider === provider.id ? "active" : ""}`} key={provider.id} onClick={() => setSelectedProvider(provider.id)}>
+              <div>
+                <strong>{provider.label}</strong>
+                <small>{provider.model}</small>
+              </div>
+              <span>{provider.status}</span>
             </button>
-          </div>
-          <pre>{JSON.stringify(handoff, null, 2)}</pre>
+          ))}
+        </div>
+        <section className="router-summary">
+          <strong>Connections</strong>
+          <span>{connections.length} imported OAuth connection(s)</span>
+          <button onClick={() => setPage("providers")}>Manage providers</button>
         </section>
-
-        <ConversationPanel turns={state.turns} onAddTurn={addTurn} />
       </aside>
     </main>
   );
 }
 
-function TaskContinuityPanel({ task, onUpdate, onUpdatePlanItem, onAddPlanItem, onAutoSwitch }) {
-  return (
-    <section className="task-continuity" aria-label="Active task continuity">
-      <div className="task-main">
-        <div className="section-head">
-          <h2>Active Task Continuity</h2>
-          <div className="phase-pills" role="group" aria-label="Task phase">
-            {taskPhases.map((phase) => (
-              <button className={task.phase === phase ? "active" : ""} key={phase} onClick={() => onUpdate({ phase })}>
-                {phase}
-              </button>
-            ))}
-          </div>
-        </div>
-        <label className="field">
-          <span>Implementation state</span>
-          <textarea value={task.implementation} onChange={(event) => onUpdate({ implementation: event.target.value })} />
-        </label>
-      </div>
+function ProvidersPage({ providers, connections, backendStatus, onBack, onRefresh, onOutput }) {
+  const [scan, setScan] = useState(null);
+  const [selected, setSelected] = useState(providers[0]?.id ?? "openai");
+  const current = providers.find((provider) => provider.id === selected) ?? providers[0];
 
-      <div className="task-plan">
-        <div className="section-head">
-          <h2>Plan Snapshot</h2>
-          <button className="icon-button" title="Add plan step" aria-label="Add plan step" onClick={onAddPlanItem}>
-            <Plus size={16} />
-          </button>
-        </div>
-        <div className="plan-list">
-          {task.plan.map((item, index) => (
-            <label className="plan-row" key={item.id}>
-              <input type="checkbox" checked={item.done} onChange={(event) => onUpdatePlanItem(index, { done: event.target.checked })} />
-              <input value={item.text} onChange={(event) => onUpdatePlanItem(index, { text: event.target.value })} />
-            </label>
-          ))}
-        </div>
-        <label className="field">
-          <span>Resume instruction</span>
-          <textarea value={task.resumeInstruction} onChange={(event) => onUpdate({ resumeInstruction: event.target.value })} />
-        </label>
-        <button className="limit-button" onClick={onAutoSwitch}>
-          Simulate provider limit and auto switch
-        </button>
-      </div>
-    </section>
-  );
-}
+  async function scanOauth() {
+    const response = await fetch(`${apiBase}/api/oauth/discover`);
+    const payload = await response.json();
+    setScan(payload);
+    onOutput("Scanned local OAuth paths");
+  }
 
-function PromptComposer({ task, onUpdate, onSubmit }) {
-  const [draft, setDraft] = useState(task.prompt);
-
-  useEffect(() => {
-    setDraft(task.prompt);
-  }, [task.prompt]);
-
-  return (
-    <form
-      className="prompt-composer"
-      onSubmit={(event) => {
-        event.preventDefault();
-        const prompt = draft.trim();
-        if (!prompt) return;
-        onSubmit(prompt);
-      }}
-    >
-      <textarea
-        value={draft}
-        onChange={(event) => {
-          setDraft(event.target.value);
-          onUpdate({ prompt: event.target.value });
-        }}
-        placeholder="พิมพ์ prompt เพื่อแก้ไขโค้ด แล้ว context จะถูกเก็บต่อเนื่องแม้ provider ถูกสลับ"
-      />
-      <div className="composer-actions">
-        <span>{task.phase}</span>
-        <button type="submit">Send prompt</button>
-      </div>
-    </form>
-  );
-}
-
-function ProvidersPage({ router, backendStatus, onBack, onUpdate, onUpdateProvider, onLoadBackend, onSaveBackend }) {
-  const oauthProviders = router.providers.filter((item) => item.auth === "oauth" || item.id === "antigravity" || ["openai", "anthropic", "gemini", "local"].includes(item.id));
-  const [selectedId, setSelectedId] = useState(oauthProviders[0]?.id);
-  const selectedIndex = Math.max(0, router.providers.findIndex((item) => item.id === selectedId));
-  const selected = router.providers[selectedIndex] ?? router.providers[0];
+  async function importOauth(providerId) {
+    const response = await fetch(`${apiBase}/api/oauth/import-local/${providerId}`, { method: "POST" });
+    const payload = await response.json();
+    onOutput(response.ok ? `Imported OAuth for ${providerId}` : `Import failed: ${payload.error?.message ?? "unknown error"}`);
+    await onRefresh();
+  }
 
   return (
     <main className="providers-page">
       <header className="providers-header">
         <div className="brand">
-          <div className="mark" aria-hidden="true">AI</div>
+          <div className="mark">AI</div>
           <div>
-            <h1>OAuth Providers</h1>
-            <p>Connect local AI providers first, then route coding agents through the standalone gateway</p>
+            <h1>Provider Settings</h1>
+            <p>Connect local OAuth providers and verify the backend router.</p>
           </div>
         </div>
         <div className="providers-actions">
-          <span className="status-pill">{backendStatus}</span>
-          <button onClick={onLoadBackend}>Refresh</button>
-          <button onClick={onSaveBackend}>Save providers</button>
+          <span className={`status-pill ${backendStatus}`}>{backendStatus}</span>
+          <button onClick={scanOauth}>Scan local OAuth</button>
+          <button onClick={onRefresh}>Refresh</button>
           <button onClick={onBack}>Back to editor</button>
         </div>
       </header>
-
       <section className="providers-layout">
         <aside className="provider-catalog">
-          <section className="provider-group">
-            <div className="section-head">
-              <h2>OAuth Providers</h2>
-              <span className="status-pill">{oauthProviders.length}</span>
-            </div>
-            <div className="provider-list">
-              {oauthProviders.map((item) => (
-                <button className={`provider-list-card ${item.id === selected?.id ? "active" : ""}`} key={item.id} onClick={() => setSelectedId(item.id)}>
-                  <div>
-                    <strong>{item.label}</strong>
-                    <small>{item.model}</small>
-                  </div>
-                  <span>{item.status}</span>
-                </button>
-              ))}
-            </div>
-          </section>
+          <div className="section-head">
+            <h2>Providers</h2>
+            <span className="status-pill">{providers.length}</span>
+          </div>
+          <div className="provider-list">
+            {providers.map((provider) => (
+              <button className={`provider-list-card ${provider.id === current?.id ? "active" : ""}`} key={provider.id} onClick={() => setSelected(provider.id)}>
+                <div>
+                  <strong>{provider.label}</strong>
+                  <small>{provider.type} · {provider.auth ?? "api-key"}</small>
+                </div>
+                <span>{provider.status}</span>
+              </button>
+            ))}
+          </div>
         </aside>
-
         <section className="provider-detail">
-          {selected ? (
+          {current ? (
             <>
               <div className="detail-head">
                 <div>
-                  <h2>{selected.label}</h2>
-                  <p>{selected.tier} provider · {selected.auth} · {selected.context ?? selected.type ?? "openai"}</p>
+                  <h2>{current.label}</h2>
+                  <p>{current.baseUrl}</p>
                 </div>
-                <label className="switch-row">
-                  <input type="checkbox" checked={selected.enabled} onChange={(event) => onUpdateProvider(selectedIndex, { enabled: event.target.checked })} />
-                  Enabled
-                </label>
+                <span className="status-pill">{current.enabled ? "enabled" : "disabled"}</span>
               </div>
-
-              <div className="connection-flow">
-                <button className={selected.auth === "oauth" ? "active" : ""}>1 OAuth / Login</button>
-                <button className={selected.auth === "api-key" ? "active" : ""}>2 API Key</button>
-                <button className={selected.tier === "custom" ? "active" : ""}>3 Compatible Node</button>
-                <button>4 Test</button>
-              </div>
-
               <div className="provider-form">
-                <label className="field">
-                  <span>Provider name</span>
-                  <input value={selected.label} onChange={(event) => onUpdateProvider(selectedIndex, { label: event.target.value })} />
-                </label>
-                <label className="field">
-                  <span>Routing alias</span>
-                  <input value={selected.id} readOnly />
-                </label>
-                <label className="field">
-                  <span>Model</span>
-                  <input value={selected.model} onChange={(event) => onUpdateProvider(selectedIndex, { model: event.target.value })} />
-                </label>
-                <label className="field">
-                  <span>Base URL</span>
-                  <input value={selected.baseUrl} onChange={(event) => onUpdateProvider(selectedIndex, { baseUrl: event.target.value })} />
-                </label>
-                <label className="field">
-                  <span>API key env</span>
-                  <input value={selected.apiKeyEnv} onChange={(event) => onUpdateProvider(selectedIndex, { apiKeyEnv: event.target.value })} />
-                </label>
-                <label className="field">
-                  <span>Auth</span>
-                  <select value={selected.auth} onChange={(event) => onUpdateProvider(selectedIndex, { auth: event.target.value })}>
-                    <option value="oauth">OAuth</option>
-                    <option value="api-key">API key</option>
-                    <option value="none">No auth</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Tier</span>
-                  <select value={selected.tier} onChange={(event) => onUpdateProvider(selectedIndex, { tier: event.target.value })}>
-                    <option value="subscription">Subscription</option>
-                    <option value="cheap">Cheap</option>
-                    <option value="free">Free</option>
-                    <option value="custom">Custom</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Status</span>
-                  <select value={selected.status} onChange={(event) => onUpdateProvider(selectedIndex, { status: event.target.value })}>
-                    <option value="connected">connected</option>
-                    <option value="ready">ready</option>
-                    <option value="needs-key">needs key</option>
-                    <option value="draft">draft</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Quota</span>
-                  <input type="number" min="0" max="100" value={selected.quota} onChange={(event) => onUpdateProvider(selectedIndex, { quota: Number(event.target.value) })} />
-                </label>
+                <label className="field"><span>Model</span><input readOnly value={current.model} /></label>
+                <label className="field"><span>API key env</span><input readOnly value={current.apiKeyEnv} /></label>
+                <label className="field"><span>Type</span><input readOnly value={current.type} /></label>
               </div>
-
               <section className="connections-panel">
-                <div className="section-head">
-                  <h2>Connections</h2>
-                  <button><Plus size={15} /> Add connection</button>
-                </div>
-                <article className="connection-row">
-                  <span>{selected.enabled ? "active" : "disabled"}</span>
-                  <strong>{selected.label}</strong>
-                  <code>{selected.apiKeyEnv}</code>
-                  <small>{selected.quota}% quota</small>
-                </article>
+                <div className="section-head"><h2>Connections</h2></div>
+                {connections.filter((connection) => connection.provider === current.id).map((connection) => (
+                  <article className="connection-row imported" key={connection.id}>
+                    <span>oauth</span>
+                    <strong>{connection.hasAccessToken ? "access token" : "refresh only"}</strong>
+                    <code>{connection.sourcePath ?? connection.importedAt}</code>
+                    <small>{connection.expiresAt ? `expires ${new Date(connection.expiresAt).toLocaleDateString()}` : "no expiry"}</small>
+                  </article>
+                ))}
+                {!connections.some((connection) => connection.provider === current.id) ? <p className="muted-text">No imported connection for this provider.</p> : null}
               </section>
-
-              <RouterSetupPanel
-                router={router}
-                backendStatus={backendStatus}
-                onUpdate={onUpdate}
-                onUpdateProvider={onUpdateProvider}
-                onLoadBackend={onLoadBackend}
-                onSaveBackend={onSaveBackend}
-              />
+              {scan ? (
+                <section className="connections-panel">
+                  <div className="section-head"><h2>Local OAuth Scan</h2></div>
+                  <div className="discovery-list">
+                    {scan.results.map((item) => (
+                      <article className={`discovery-row ${item.found ? "found" : ""}`} key={item.provider}>
+                        <div><strong>{item.label}</strong><small>{item.found ? `${item.matches.length} match` : `${item.checked} paths checked`}</small></div>
+                        {item.found ? <button onClick={() => importOauth(item.provider)}>Import</button> : <span>none</span>}
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
             </>
           ) : null}
         </section>
@@ -1059,288 +407,34 @@ function ProvidersPage({ router, backendStatus, onBack, onUpdate, onUpdateProvid
   );
 }
 
-function RouterSetupPanel({ router, backendStatus, onUpdate, onUpdateProvider, onLoadBackend, onSaveBackend }) {
-  const selectedCombo = router.combos.find((combo) => combo.id === router.selectedCombo) ?? router.combos[0];
-  const cliConfig = buildCliConfig(router, selectedCombo);
-  const routePlan = buildStandaloneRoutePlan(router, selectedCombo);
-
-  return (
-    <section className="panel router-setup">
-      <div className="section-head">
-        <h2>Standalone Router</h2>
-        <span className="status-pill">{backendStatus}</span>
-      </div>
-      <div className="backend-actions">
-        <button onClick={onLoadBackend}>Load backend providers</button>
-        <button onClick={onSaveBackend}>Save providers</button>
-      </div>
-
-      <div className="router-fields">
-        <label className="field">
-          <span>Internal OpenAI-compatible endpoint</span>
-          <input value={router.endpoint} onChange={(event) => onUpdate({ endpoint: event.target.value })} />
-        </label>
-        <label className="field">
-          <span>Gateway path</span>
-          <input value={router.gatewayPath} onChange={(event) => onUpdate({ gatewayPath: event.target.value })} />
-        </label>
-        <label className="field">
-          <span>Local router API key</span>
-          <input value={router.apiKey} onChange={(event) => onUpdate({ apiKey: event.target.value })} />
-        </label>
-        <label className="field">
-          <span>Model combo</span>
-          <select value={router.selectedCombo} onChange={(event) => onUpdate({ selectedCombo: event.target.value })}>
-            {router.combos.map((combo) => (
-              <option value={combo.id} key={combo.id}>
-                {combo.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="field">
-          <span>Fallback strategy</span>
-          <select value={router.fallbackStrategy} onChange={(event) => onUpdate({ fallbackStrategy: event.target.value })}>
-            <option value="subscription-cheap-free">Subscription to cheap to free</option>
-            <option value="free-first">Free to cheap to subscription</option>
-            <option value="manual-order">Combo order only</option>
-          </select>
-        </label>
-      </div>
-
-      <div className="feature-grid">
-        <CheckRow checked={router.tokenSaver} label="RTK token saver" onChange={(checked) => onUpdate({ tokenSaver: checked })} />
-        <CheckRow checked={router.formatTranslation} label="Format translation" onChange={(checked) => onUpdate({ formatTranslation: checked })} />
-        <CheckRow checked={router.quotaTracking} label="Quota tracking" onChange={(checked) => onUpdate({ quotaTracking: checked })} />
-        <CheckRow checked={router.requestLogging} label="Request logging" onChange={(checked) => onUpdate({ requestLogging: checked })} />
-      </div>
-
-      <div className="tier-stack">
-        {router.providers.map((item, index) => (
-          <article className="tier-row" key={item.id}>
-            <div>
-              <strong>{item.label}</strong>
-              <span>{item.tier} - {item.auth}</span>
-            </div>
-            <label className="mini-check">
-              <input type="checkbox" checked={item.enabled} onChange={(event) => onUpdateProvider(index, { enabled: event.target.checked })} />
-              enabled
-            </label>
-            <input value={item.model} onChange={(event) => onUpdateProvider(index, { model: event.target.value })} />
-            <input value={item.baseUrl} onChange={(event) => onUpdateProvider(index, { baseUrl: event.target.value })} />
-            <input value={item.apiKeyEnv} onChange={(event) => onUpdateProvider(index, { apiKeyEnv: event.target.value })} />
-            <input
-              type="number"
-              min="0"
-              max="100"
-              value={item.quota}
-              onChange={(event) => onUpdateProvider(index, { quota: Number(event.target.value) })}
-            />
-            <select value={item.status} onChange={(event) => onUpdateProvider(index, { status: event.target.value })}>
-              <option value="connected">connected</option>
-              <option value="ready">ready</option>
-              <option value="needs-key">needs key</option>
-              <option value="draft">draft</option>
-            </select>
-          </article>
-        ))}
-      </div>
-
-      <div className="route-preview">
-        <h3>Route preview</h3>
-        {routePlan.map((route, index) => (
-          <div className="route-hop" key={`${route.provider.id}-${index}`}>
-            <span>{index + 1}</span>
-            <strong>{route.provider.label}</strong>
-            <code>{route.model}</code>
-            <small>{route.provider.quota}% quota</small>
-          </div>
-        ))}
-      </div>
-
-      <pre className="cli-snippet">{cliConfig}</pre>
-    </section>
-  );
+function BottomPanel({ tab, output, problems, backendStatus, selectedModel, activeProvider, dirtyFiles }) {
+  if (tab === "problems") {
+    return <div className="bottom-content problems-list">{(problems.length ? problems : ["No problems detected."]).map((problem) => <div className="problem-row" key={problem}>{problem}</div>)}</div>;
+  }
+  if (tab === "output") {
+    return <div className="bottom-content output-list">{output.map((line, index) => <pre key={`${index}-${line}`}>{line}</pre>)}</div>;
+  }
+  return <pre>{`Backend: ${backendStatus}\nEndpoint: ${apiBase}/v1\nModel: ${selectedModel}\nProvider: ${activeProvider?.label ?? "none"}\nUnsaved files: ${dirtyFiles.length ? dirtyFiles.join(", ") : "none"}`}</pre>;
 }
 
-function buildCliConfig(router, combo) {
-  const endpointNoV1 = router.endpoint.replace(/\/v1\/?$/, "");
-  const model = combo?.name ?? router.selectedCombo;
-  return [
-    "# AIIA standalone router config",
-    `AIIA_ROUTER_MODE="${router.mode}"`,
-    `AIIA_ROUTER_BASE_URL="${endpointNoV1}"`,
-    `AIIA_ROUTER_GATEWAY_PATH="${router.gatewayPath}"`,
-    `AIIA_ROUTER_API_KEY="${router.apiKey}"`,
-    `MODEL="${model}"`,
-    "",
-    "# Provider keys stay local to this app/runtime",
-    ...router.providers.map((provider) => `${provider.apiKeyEnv}="${provider.status === "needs-key" ? "paste-key-here" : "local-token-or-oauth"}"`),
-    "",
-    "# Embedded router behavior",
-    JSON.stringify(
-      {
-        mode: router.mode,
-        fallbackStrategy: router.fallbackStrategy,
-        tokenSaver: router.tokenSaver,
-        formatTranslation: router.formatTranslation,
-        combo: combo?.models ?? []
-      },
-      null,
-      2
-    )
-  ].join("\n");
+function lineNumbers(text) {
+  return Array.from({ length: Math.max(1, text.split("\n").length) }, (_, index) => index + 1).join("\n");
 }
 
-function buildStandaloneRoutePlan(router, combo) {
-  const tierOrder =
-    router.fallbackStrategy === "free-first"
-      ? ["free", "cheap", "subscription", "custom"]
-      : router.fallbackStrategy === "manual-order"
-        ? []
-        : ["subscription", "cheap", "free", "custom"];
-  const comboModels = combo?.models ?? [];
-  const routes = comboModels
-    .map((model) => {
-      const providerId = model.split("/")[0];
-      const provider = router.providers.find((item) => item.id === providerId);
-      return provider ? { provider, model } : null;
-    })
-    .filter(Boolean)
-    .filter(({ provider }) => provider.enabled && provider.status !== "needs-key" && provider.quota > 0);
-
-  if (router.fallbackStrategy === "manual-order") return routes;
-  return routes.sort((a, b) => tierOrder.indexOf(a.provider.tier) - tierOrder.indexOf(b.provider.tier));
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function buildHandoff(state, provider) {
-  const pinnedMemory = state.options.includeMemory ? state.memory.filter((item) => item.pinned) : [];
-  const recentTurns = state.turns.slice(-6);
-  const { handoff: _handoff, ...workingFiles } = state.files;
-  const selectedCombo = state.router.combos.find((combo) => combo.id === state.router.selectedCombo) ?? state.router.combos[0];
-  return {
-    schema: "aiia.context-capsule.v1",
-    sessionName: state.sessionName,
-    generatedAt: new Date().toISOString(),
-    route: {
-      provider: provider.id,
-      model: provider.model,
-      policy: state.policy
-    },
-    router: {
-      mode: state.router.mode,
-      endpoint: state.router.endpoint,
-      gatewayPath: state.router.gatewayPath,
-      selectedCombo: selectedCombo?.name ?? state.router.selectedCombo,
-      comboModels: selectedCombo?.models ?? [],
-      fallbackStrategy: state.router.fallbackStrategy,
-      tokenSaver: state.router.tokenSaver,
-      formatTranslation: state.router.formatTranslation,
-      requestLogging: state.router.requestLogging,
-      quotaTracking: state.router.quotaTracking,
-      providers: state.router.providers.map(({ id, label, auth, tier, status, enabled, model, baseUrl, apiKeyEnv, quota }) => ({
-        id,
-        label,
-        auth,
-        tier,
-        status,
-        enabled,
-        model,
-        baseUrl,
-        apiKeyEnv,
-        quota
-      })),
-      routePlan: buildStandaloneRoutePlan(state.router, selectedCombo).map(({ provider, model }) => ({
-        providerId: provider.id,
-        provider: provider.label,
-        model,
-        tier: provider.tier,
-        baseUrl: provider.baseUrl,
-        apiKeyEnv: provider.apiKeyEnv
-      })),
-      standaloneRule: "Route locally from this config. Do not require a running 9Router service."
-    },
-    task: {
-      prompt: state.activeTask.prompt,
-      phase: state.activeTask.phase,
-      plan: state.activeTask.plan,
-      implementation: state.activeTask.implementation,
-      currentStep: state.activeTask.currentStep,
-      resumeInstruction: state.activeTask.resumeInstruction,
-      switchEvents: state.activeTask.switchEvents,
-      continuityRule:
-        "When provider changes because of quota limit or manual routing, continue from this task object and files without asking for a new prompt/context."
-    },
-    continuity: {
-      objective: pinnedMemory[0]?.body ?? "",
-      pinnedMemory,
-      recentTurns,
-      includeCode: state.options.includeCode,
-      includeMemory: state.options.includeMemory,
-      includeDiff: state.options.includeDiff
-    },
-    files: state.options.includeCode ? workingFiles : {},
-    diffSummary: state.options.includeDiff ? "Working changes are represented by active editor content and recent turns." : "",
-    resumePrompt:
-      "Continue this session from the Context Capsule. Preserve user decisions, active files, and pinned memory. If provider-specific context is missing, infer from capsule fields before asking."
-  };
+function capitalize(value) {
+  return `${value[0].toUpperCase()}${value.slice(1)}`;
 }
 
-function Metric({ value, label }) {
-  return (
-    <div>
-      <strong>{value}</strong>
-      <span>{label}</span>
-    </div>
-  );
-}
-
-function CheckRow({ checked, label, onChange }) {
-  return (
-    <label className="check-row">
-      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
-      <span>{label}</span>
-    </label>
-  );
-}
-
-function ConversationPanel({ turns, onAddTurn }) {
-  const [text, setText] = useState("");
-  return (
-    <section className="panel">
-      <div className="section-head">
-        <h2>Conversation Turns</h2>
-        <GitBranch size={16} aria-hidden="true" />
-      </div>
-      <form
-        className="turn-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const trimmed = text.trim();
-          if (!trimmed) return;
-          onAddTurn(trimmed);
-          setText("");
-        }}
-      >
-        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="บันทึกสิ่งที่ user/agent ตัดสินใจล่าสุด" />
-        <button type="submit">
-          <Network size={15} />
-          Add turn
-        </button>
-      </form>
-      <div className="turn-list">
-        {turns
-          .slice(-5)
-          .reverse()
-          .map((turn) => (
-            <article className="turn-item" key={`${turn.at}-${turn.text}`}>
-              <time>{new Date(turn.at).toLocaleString()}</time>
-              {turn.text}
-            </article>
-          ))}
-      </div>
-    </section>
-  );
+function languageFor(file) {
+  if (file.endsWith(".json")) return "JSON";
+  if (file.endsWith(".md")) return "Markdown";
+  if (file.endsWith(".tsx") || file.endsWith(".jsx")) return "React";
+  if (file.endsWith(".ts")) return "TypeScript";
+  return "Plain Text";
 }
 
 createRoot(document.getElementById("root")).render(<App />);
