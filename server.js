@@ -1,5 +1,6 @@
 import cors from "cors";
 import express from "express";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -123,6 +124,130 @@ const defaults = {
     antigravity: "antigravity/gemini-2.5-pro"
   }
 };
+
+const claudeCodeOAuth = {
+  clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+  authorizeUrl: "https://claude.ai/oauth/authorize",
+  tokenUrl: "https://console.anthropic.com/v1/oauth/token",
+  scope: "org:create_api_key user:profile user:inference",
+  providerId: "anthropic"
+};
+
+function claudeCodeRedirectUri() {
+  return `http://127.0.0.1:${port}/callback`;
+}
+
+function pendingOAuthPath() {
+  return join(dataDir, "claude-oauth-pending.json");
+}
+
+function loadPendingOAuth() {
+  const path = pendingOAuthPath();
+  if (!existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function savePendingOAuth(pending) {
+  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+  writeFileSync(pendingOAuthPath(), JSON.stringify(pending, null, 2));
+}
+
+function createClaudeCodeAuthorizeUrl() {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+  const state = randomBytes(32).toString("base64url");
+  const pending = loadPendingOAuth();
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [key, value] of Object.entries(pending)) {
+    if (!value?.createdAt || value.createdAt < cutoff) delete pending[key];
+  }
+  pending[state] = { codeVerifier, createdAt: Date.now() };
+  savePendingOAuth(pending);
+
+  const url = new URL(claudeCodeOAuth.authorizeUrl);
+  url.searchParams.set("code", "true");
+  url.searchParams.set("client_id", claudeCodeOAuth.clientId);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", claudeCodeRedirectUri());
+  url.searchParams.set("scope", claudeCodeOAuth.scope);
+  url.searchParams.set("code_challenge", codeChallenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("state", state);
+  return { url: url.toString(), state };
+}
+
+async function exchangeClaudeCodeAuthorizationCode(code, state) {
+  const pending = loadPendingOAuth();
+  const session = pending[state];
+  if (!session?.codeVerifier) {
+    const error = new Error("OAuth session expired or invalid state");
+    error.status = 400;
+    throw error;
+  }
+
+  const response = await fetch(claudeCodeOAuth.tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "authorization_code",
+      code,
+      client_id: claudeCodeOAuth.clientId,
+      redirect_uri: claudeCodeRedirectUri(),
+      code_verifier: session.codeVerifier,
+      state
+    })
+  });
+  if (!response.ok) {
+    const error = new Error(`Token exchange failed (${response.status})`);
+    error.status = 502;
+    throw error;
+  }
+
+  delete pending[state];
+  savePendingOAuth(pending);
+  return response.json();
+}
+
+function saveClaudeCodeConnection(tokens) {
+  const state = loadState();
+  const expiresAt = tokens.expires_in
+    ? new Date(Date.now() + Number(tokens.expires_in) * 1000).toISOString()
+    : tokens.expires_at;
+  const connection = {
+    id: `conn-claude-code-${Date.now()}`,
+    provider: claudeCodeOAuth.providerId,
+    authType: "oauth",
+    isActive: true,
+    priority: 0,
+    importedAt: new Date().toISOString(),
+    sourcePath: "claude-code-oauth",
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt,
+    providerSpecificData: {
+      providerId: claudeCodeOAuth.providerId,
+      clientId: claudeCodeOAuth.clientId,
+      tokenUrl: claudeCodeOAuth.tokenUrl,
+      scope: tokens.scope ?? claudeCodeOAuth.scope,
+      account: tokens.account?.email_address ?? tokens.account?.email
+    }
+  };
+  state.providerConnections = [
+    ...(state.providerConnections ?? []).filter((item) => item.sourcePath !== "claude-code-oauth"),
+    connection
+  ];
+  state.providers = state.providers.map((provider) =>
+    provider.id === claudeCodeOAuth.providerId
+      ? { ...provider, auth: "oauth", status: "connected", enabled: true }
+      : provider
+  );
+  saveState(state);
+  return connection;
+}
 
 const oauthDiscoveryTargets = [
   {
@@ -369,7 +494,11 @@ function providerHeaders(provider, connection) {
   const key = connection?.accessToken ?? process.env[provider.apiKeyEnv];
   const headers = { "content-type": "application/json" };
   if (provider.type === "anthropic") {
-    headers["x-api-key"] = key ?? "";
+    if (connection?.authType === "oauth" && key) {
+      headers.authorization = `Bearer ${key}`;
+    } else {
+      headers["x-api-key"] = key ?? "";
+    }
     headers["anthropic-version"] = "2023-06-01";
   } else if (provider.type === "antigravity") {
     headers.authorization = `Bearer ${key ?? ""}`;
@@ -697,6 +826,28 @@ app.post("/api/providers/:id/test", async (req, res) => {
     model: provider.model
   };
   res.status(validation.ok ? 200 : 422).json(validation);
+});
+
+app.get("/api/oauth/claude-code/authorize", (_req, res) => {
+  const { url, state } = createClaudeCodeAuthorizeUrl();
+  res.json({ url, state, redirectUri: claudeCodeRedirectUri() });
+});
+
+app.get("/callback", async (req, res) => {
+  const { code, state, error, error_description: errorDescription } = req.query;
+  if (error) {
+    return res.status(400).send(`<html><body style="font-family:sans-serif;padding:24px"><h1>Claude Code sign-in failed</h1><p>${errorDescription ?? error}</p></body></html>`);
+  }
+  if (!code || !state) {
+    return res.status(400).send("<html><body style=\"font-family:sans-serif;padding:24px\"><h1>Missing OAuth code</h1><p>Return to Provider Settings and try again.</p></body></html>");
+  }
+  try {
+    const tokens = await exchangeClaudeCodeAuthorizationCode(String(code), String(state));
+    saveClaudeCodeConnection(tokens);
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:24px;max-width:520px"><h1>Claude Code connected</h1><p>You can close this tab and return to AIIA Provider Settings.</p><script>setTimeout(() => window.close(), 1200)</script></body></html>`);
+  } catch (exchangeError) {
+    res.status(exchangeError.status ?? 500).send(`<html><body style="font-family:sans-serif;padding:24px"><h1>Token exchange failed</h1><p>${exchangeError.message}</p></body></html>`);
+  }
 });
 
 app.get("/api/oauth/discover", (_req, res) => {

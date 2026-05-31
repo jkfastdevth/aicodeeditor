@@ -375,6 +375,31 @@ h2 { color: #cbd6d0; font-size: 13px; letter-spacing: 0; text-transform: upperca
 }
 
 .providers-header { padding: 12px 14px; }
+
+.claude-code-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-color: rgba(54, 197, 138, 0.55);
+  background: rgba(54, 197, 138, 0.12);
+  color: #d8f8ea;
+}
+
+.claude-code-oauth-panel {
+  padding: 12px 14px;
+  border: 1px solid rgba(54, 197, 138, 0.45);
+  border-radius: 8px;
+  background: rgba(54, 197, 138, 0.07);
+}
+
+.claude-code-oauth-panel .oauth-link {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  color: #9fe8c8;
+  font-size: 12px;
+  line-height: 1.5;
+}
 .brand { display: flex; align-items: center; gap: 12px; }
 .brand p { margin-top: 3px; color: var(--muted); font-size: 12px; }
 .mark {

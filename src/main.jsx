@@ -307,8 +307,26 @@ function App() {
 
 function ProvidersPage({ providers, connections, backendStatus, onBack, onRefresh, onOutput }) {
   const [scan, setScan] = useState(null);
+  const [claudeCodeAuthUrl, setClaudeCodeAuthUrl] = useState("");
   const [selected, setSelected] = useState(providers[0]?.id ?? "openai");
   const current = providers.find((provider) => provider.id === selected) ?? providers[0];
+
+  async function startClaudeCodeOAuth() {
+    try {
+      const response = await fetch(`${apiBase}/api/oauth/claude-code/authorize`);
+      const payload = await response.json();
+      if (!response.ok) {
+        onOutput(`Claude Code OAuth failed: ${payload.error?.message ?? "unknown error"}`);
+        return;
+      }
+      setClaudeCodeAuthUrl(payload.url);
+      setSelected("anthropic");
+      onOutput("Opened Claude Code OAuth — complete sign-in in your browser");
+      window.open(payload.url, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      onOutput(`Claude Code OAuth failed: ${error.message}`);
+    }
+  }
 
   async function scanOauth() {
     const response = await fetch(`${apiBase}/api/oauth/discover`);
@@ -336,11 +354,27 @@ function ProvidersPage({ providers, connections, backendStatus, onBack, onRefres
         </div>
         <div className="providers-actions">
           <span className={`status-pill ${backendStatus}`}>{backendStatus}</span>
+          <button className="claude-code-add-btn" onClick={startClaudeCodeOAuth} title="Connect Claude Code via OAuth">
+            <Plus size={15} />
+            Claude Code
+          </button>
           <button onClick={scanOauth}>Scan local OAuth</button>
           <button onClick={onRefresh}>Refresh</button>
           <button onClick={onBack}>Back to editor</button>
         </div>
       </header>
+      {claudeCodeAuthUrl ? (
+        <section className="claude-code-oauth-panel">
+          <div className="section-head">
+            <h2>Claude Code sign-in</h2>
+            <button onClick={() => setClaudeCodeAuthUrl("")}>Dismiss</button>
+          </div>
+          <p className="muted-text">Complete sign-in in the browser tab, or open this URL manually:</p>
+          <a className="oauth-link" href={claudeCodeAuthUrl} target="_blank" rel="noreferrer">
+            {claudeCodeAuthUrl}
+          </a>
+        </section>
+      ) : null}
       <section className="providers-layout">
         <aside className="provider-catalog">
           <div className="section-head">
