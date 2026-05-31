@@ -1,5 +1,6 @@
 import cors from "cors";
 import express from "express";
+import { execSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -25,6 +26,12 @@ const defaults = {
   tokenSaver: true,
   formatTranslation: true,
   providerConnections: [],
+  connectionRotation: {},
+  providerConnectionSettings: {
+    antigravity: { roundRobin: true },
+    anthropic: { roundRobin: true },
+    "github-copilot": { roundRobin: true }
+  },
   providers: [
     {
       id: "builtin",
@@ -111,6 +118,19 @@ const defaults = {
       baseUrl: "http://127.0.0.1:11434/v1/chat/completions",
       apiKeyEnv: "LOCAL_LLM_API_KEY",
       quota: 100
+    },
+    {
+      id: "github-copilot",
+      label: "GitHub Copilot",
+      enabled: false,
+      tier: "subscription",
+      status: "needs-key",
+      type: "openai",
+      auth: "oauth",
+      model: "gpt-4.1",
+      baseUrl: "https://api.githubcopilot.com",
+      apiKeyEnv: "GITHUB_COPILOT_TOKEN",
+      quota: 100
     }
   ],
   combos: [
@@ -126,23 +146,32 @@ const defaults = {
 };
 
 const claudeCodeOAuth = {
-  clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+  clientId: process.env.CLAUDE_CODE_OAUTH_CLIENT_ID?.trim() || "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
   authorizeUrl: "https://claude.ai/oauth/authorize",
   tokenUrl: "https://console.anthropic.com/v1/oauth/token",
   scope: "org:create_api_key user:profile user:inference",
   providerId: "anthropic"
 };
 
-function claudeCodeRedirectUri() {
-  return `http://127.0.0.1:${port}/callback`;
+function oauthRedirectUri() {
+  return `http://localhost:${port}/callback`;
 }
 
 function pendingOAuthPath() {
-  return join(dataDir, "claude-oauth-pending.json");
+  return join(dataDir, "oauth-pending.json");
 }
 
 function loadPendingOAuth() {
   const path = pendingOAuthPath();
+  const legacyPath = join(dataDir, "claude-oauth-pending.json");
+  if (!existsSync(path) && existsSync(legacyPath)) {
+    try {
+      const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
+      savePendingOAuth(legacy);
+    } catch {
+      // ignore legacy migration errors
+    }
+  }
   if (!existsSync(path)) return {};
   try {
     return JSON.parse(readFileSync(path, "utf8"));
@@ -156,38 +185,49 @@ function savePendingOAuth(pending) {
   writeFileSync(pendingOAuthPath(), JSON.stringify(pending, null, 2));
 }
 
-function createClaudeCodeAuthorizeUrl() {
-  const codeVerifier = randomBytes(32).toString("base64url");
-  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
-  const state = randomBytes(32).toString("base64url");
-  const pending = loadPendingOAuth();
+function prunePendingOAuth(pending) {
   const cutoff = Date.now() - 30 * 60 * 1000;
   for (const [key, value] of Object.entries(pending)) {
     if (!value?.createdAt || value.createdAt < cutoff) delete pending[key];
   }
-  pending[state] = { codeVerifier, createdAt: Date.now() };
+  return pending;
+}
+
+function createClaudeCodeAuthorizeUrl(redirectUriOverride) {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+  const state = randomBytes(32).toString("base64url");
+  const redirectUri = redirectUriOverride ?? oauthRedirectUri();
+  const pending = prunePendingOAuth(loadPendingOAuth());
+  pending[state] = { provider: "claude", codeVerifier, createdAt: Date.now() };
   savePendingOAuth(pending);
 
   const url = new URL(claudeCodeOAuth.authorizeUrl);
   url.searchParams.set("code", "true");
   url.searchParams.set("client_id", claudeCodeOAuth.clientId);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("redirect_uri", claudeCodeRedirectUri());
+  url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("scope", claudeCodeOAuth.scope);
   url.searchParams.set("code_challenge", codeChallenge);
   url.searchParams.set("code_challenge_method", "S256");
   url.searchParams.set("state", state);
-  return { url: url.toString(), state };
+  const authUrl = url.toString();
+  return { url: authUrl, authUrl, state, redirectUri, codeVerifier };
 }
 
-async function exchangeClaudeCodeAuthorizationCode(code, state) {
+function claudeCodeAuthorizePayload(redirectUriOverride) {
+  return createClaudeCodeAuthorizeUrl(redirectUriOverride);
+}
+
+async function exchangeClaudeCodeAuthorizationCode(code, state, codeVerifierOverride, redirectUriOverride) {
   const pending = loadPendingOAuth();
-  const session = pending[state];
+  const session = codeVerifierOverride ? { codeVerifier: codeVerifierOverride } : pending[state];
   if (!session?.codeVerifier) {
     const error = new Error("OAuth session expired or invalid state");
     error.status = 400;
     throw error;
   }
+  const redirectUri = redirectUriOverride ?? oauthRedirectUri();
 
   const response = await fetch(claudeCodeOAuth.tokenUrl, {
     method: "POST",
@@ -196,7 +236,7 @@ async function exchangeClaudeCodeAuthorizationCode(code, state) {
       grant_type: "authorization_code",
       code,
       client_id: claudeCodeOAuth.clientId,
-      redirect_uri: claudeCodeRedirectUri(),
+      redirect_uri: redirectUri,
       code_verifier: session.codeVerifier,
       state
     })
@@ -224,7 +264,9 @@ function saveClaudeCodeConnection(tokens) {
     isActive: true,
     priority: 0,
     importedAt: new Date().toISOString(),
-    sourcePath: "claude-code-oauth",
+    sourcePath: tokens.account?.email_address
+      ? `claude-code-oauth:${tokens.account.email_address}`
+      : "claude-code-oauth",
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
     expiresAt,
@@ -236,10 +278,7 @@ function saveClaudeCodeConnection(tokens) {
       account: tokens.account?.email_address ?? tokens.account?.email
     }
   };
-  state.providerConnections = [
-    ...(state.providerConnections ?? []).filter((item) => item.sourcePath !== "claude-code-oauth"),
-    connection
-  ];
+  state.providerConnections = [...(state.providerConnections ?? []), connection];
   state.providers = state.providers.map((provider) =>
     provider.id === claudeCodeOAuth.providerId
       ? { ...provider, auth: "oauth", status: "connected", enabled: true }
@@ -247,6 +286,394 @@ function saveClaudeCodeConnection(tokens) {
   );
   saveState(state);
   return connection;
+}
+
+function requireAntigravityOAuthEnv(name) {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    const error = new Error(`${name} is not configured`);
+    error.status = 503;
+    throw error;
+  }
+  return value;
+}
+
+const antigravityOAuth = {
+  get clientId() {
+    return requireAntigravityOAuthEnv("ANTIGRAVITY_CLIENT_ID");
+  },
+  get clientSecret() {
+    return requireAntigravityOAuthEnv("ANTIGRAVITY_CLIENT_SECRET");
+  },
+  authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+  tokenUrl: "https://oauth2.googleapis.com/token",
+  userInfoUrl: "https://www.googleapis.com/oauth2/v1/userinfo",
+  loadCodeAssistEndpoint: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+  scopes: [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/cclog",
+    "https://www.googleapis.com/auth/experimentsandconfigs"
+  ],
+  providerId: "antigravity",
+  loadCodeAssistUserAgent: "google-api-nodejs-client/9.15.1",
+  loadCodeAssistApiClient: "google-cloud-sdk vscode_cloudshelleditor/0.1"
+};
+
+function getAntigravityClientMetadata() {
+  const architecture = process.arch;
+  let platform = 0;
+  if (process.platform === "darwin") platform = architecture === "arm64" ? 2 : 1;
+  else if (process.platform === "linux") platform = architecture === "arm64" ? 4 : 3;
+  else if (process.platform === "win32") platform = 5;
+  return { ideType: 9, platform, pluginType: 2 };
+}
+
+function getAntigravityLoadHeaders(accessToken) {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "User-Agent": antigravityOAuth.loadCodeAssistUserAgent,
+    "X-Goog-Api-Client": antigravityOAuth.loadCodeAssistApiClient,
+    "Client-Metadata": JSON.stringify(getAntigravityClientMetadata()),
+    "x-request-source": "local"
+  };
+}
+
+function createAntigravityAuthorizeUrl(redirectUriOverride) {
+  const state = randomBytes(32).toString("base64url");
+  const redirectUri = redirectUriOverride ?? oauthRedirectUri();
+  const pending = prunePendingOAuth(loadPendingOAuth());
+  pending[state] = { provider: "antigravity", createdAt: Date.now() };
+  savePendingOAuth(pending);
+
+  const url = new URL(antigravityOAuth.authorizeUrl);
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("client_id", antigravityOAuth.clientId);
+  url.searchParams.set("prompt", "consent");
+  url.searchParams.set("redirect_uri", redirectUri);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", antigravityOAuth.scopes.join(" "));
+  url.searchParams.set("state", state);
+  const authUrl = url.toString();
+  return { url: authUrl, authUrl, state, redirectUri };
+}
+
+function antigravityAuthorizePayload(redirectUriOverride) {
+  return createAntigravityAuthorizeUrl(redirectUriOverride);
+}
+
+async function exchangeAntigravityAuthorizationCode(code, redirectUriOverride) {
+  const redirectUri = redirectUriOverride ?? oauthRedirectUri();
+  const response = await fetch(antigravityOAuth.tokenUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json"
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: antigravityOAuth.clientId,
+      client_secret: antigravityOAuth.clientSecret,
+      code,
+      redirect_uri: redirectUri
+    })
+  });
+  if (!response.ok) {
+    const error = new Error(`Token exchange failed (${response.status})`);
+    error.status = 502;
+    throw error;
+  }
+  return response.json();
+}
+
+async function enrichAntigravityTokens(tokens) {
+  const accessToken = tokens.access_token;
+  let email;
+  let projectId = "";
+  let tierId = "legacy-tier";
+
+  try {
+    const userInfoRes = await fetch(`${antigravityOAuth.userInfoUrl}?alt=json`, {
+      headers: { Authorization: `Bearer ${accessToken}`, "x-request-source": "local" }
+    });
+    if (userInfoRes.ok) {
+      const userInfo = await userInfoRes.json();
+      email = userInfo.email;
+    }
+  } catch {
+    // optional user info
+  }
+
+  try {
+    const loadRes = await fetch(antigravityOAuth.loadCodeAssistEndpoint, {
+      method: "POST",
+      headers: getAntigravityLoadHeaders(accessToken),
+      body: JSON.stringify({ metadata: getAntigravityClientMetadata() })
+    });
+    if (loadRes.ok) {
+      const data = await loadRes.json();
+      const rawProject = data.cloudaicompanionProject;
+      projectId = typeof rawProject === "object" && rawProject?.id ? rawProject.id : rawProject ?? "";
+      if (Array.isArray(data.allowedTiers)) {
+        for (const tier of data.allowedTiers) {
+          if (tier.isDefault && tier.id) {
+            tierId = tier.id.trim();
+            break;
+          }
+        }
+      }
+    }
+  } catch {
+    // optional project discovery
+  }
+
+  return { email, projectId, tierId, scope: tokens.scope };
+}
+
+function saveAntigravityConnection(tokens, extra = {}) {
+  const state = loadState();
+  const expiresAt = tokens.expires_in
+    ? new Date(Date.now() + Number(tokens.expires_in) * 1000).toISOString()
+    : tokens.expires_at;
+  const email = extra.email;
+  const projectId = extra.projectId ?? "";
+  const connection = {
+    id: `conn-antigravity-${Date.now()}`,
+    provider: antigravityOAuth.providerId,
+    authType: "oauth",
+    isActive: true,
+    priority: 0,
+    importedAt: new Date().toISOString(),
+    sourcePath: email ? `antigravity-oauth:${email}` : "antigravity-oauth",
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt,
+    providerSpecificData: {
+      providerId: antigravityOAuth.providerId,
+      clientId: antigravityOAuth.clientId,
+      tokenUrl: antigravityOAuth.tokenUrl,
+      scope: extra.scope ?? tokens.scope,
+      account: email,
+      email,
+      projectId,
+      tierId: extra.tierId ?? "legacy-tier"
+    }
+  };
+  state.providerConnections = [...(state.providerConnections ?? []), connection];
+  state.providers = state.providers.map((provider) =>
+    provider.id === antigravityOAuth.providerId
+      ? { ...provider, auth: "oauth", status: "connected", enabled: true }
+      : provider
+  );
+  saveState(state);
+  return connection;
+}
+
+const githubCopilotOAuth = {
+  clientId: process.env.GITHUB_COPILOT_OAUTH_CLIENT_ID?.trim() || "Iv1.b507a08c87ecfe98",
+  deviceCodeUrl: "https://github.com/login/device/code",
+  accessTokenUrl: "https://github.com/login/oauth/access_token",
+  userInfoUrl: "https://api.github.com/user",
+  scope: "read:user",
+  providerId: "github-copilot"
+};
+
+async function startGithubCopilotDeviceFlow() {
+  const response = await fetch(githubCopilotOAuth.deviceCodeUrl, {
+    method: "POST",
+    headers: { Accept: "application/json", "User-Agent": "AIIA-Router/1.0" },
+    body: new URLSearchParams({
+      client_id: githubCopilotOAuth.clientId,
+      scope: githubCopilotOAuth.scope
+    })
+  });
+  if (!response.ok) {
+    const error = new Error(`GitHub device code request failed (${response.status})`);
+    error.status = 502;
+    throw error;
+  }
+  const payload = await response.json();
+  const state = randomBytes(16).toString("hex");
+  const pending = prunePendingOAuth(loadPendingOAuth());
+  pending[state] = {
+    provider: "github-copilot",
+    deviceCode: payload.device_code,
+    interval: Math.max(1, Number(payload.interval ?? 5)),
+    createdAt: Date.now(),
+    expiresAt: Date.now() + Number(payload.expires_in ?? 900) * 1000
+  };
+  savePendingOAuth(pending);
+  return {
+    state,
+    userCode: payload.user_code,
+    verificationUri: payload.verification_uri,
+    verificationUriComplete: payload.verification_uri_complete ?? payload.verification_uri,
+    interval: Math.max(1, Number(payload.interval ?? 5)),
+    expiresIn: Number(payload.expires_in ?? 900)
+  };
+}
+
+async function pollGithubCopilotDeviceOnce(state) {
+  const pending = loadPendingOAuth();
+  const session = pending[state];
+  if (!session?.deviceCode) {
+    const error = new Error("OAuth session expired or invalid state");
+    error.status = 400;
+    throw error;
+  }
+  if (session.expiresAt && Date.now() > session.expiresAt) {
+    delete pending[state];
+    savePendingOAuth(pending);
+    const error = new Error("GitHub device code expired");
+    error.status = 400;
+    throw error;
+  }
+
+  const response = await fetch(githubCopilotOAuth.accessTokenUrl, {
+    method: "POST",
+    headers: { Accept: "application/json", "User-Agent": "AIIA-Router/1.0" },
+    body: new URLSearchParams({
+      client_id: githubCopilotOAuth.clientId,
+      device_code: session.deviceCode,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code"
+    })
+  });
+  if (!response.ok) {
+    const error = new Error(`GitHub token poll failed (${response.status})`);
+    error.status = 502;
+    throw error;
+  }
+  const payload = await response.json();
+  if (payload.error === "authorization_pending") {
+    return { status: "pending", interval: session.interval ?? 5 };
+  }
+  if (payload.error === "slow_down") {
+    session.interval = (session.interval ?? 5) + 5;
+    pending[state] = session;
+    savePendingOAuth(pending);
+    return { status: "pending", interval: session.interval };
+  }
+  if (payload.error) {
+    delete pending[state];
+    savePendingOAuth(pending);
+    const error = new Error(payload.error_description ?? payload.error);
+    error.status = 400;
+    throw error;
+  }
+  if (!payload.access_token) {
+    return { status: "pending", interval: session.interval ?? 5 };
+  }
+
+  delete pending[state];
+  savePendingOAuth(pending);
+
+  let login = null;
+  try {
+    const userRes = await fetch(githubCopilotOAuth.userInfoUrl, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${payload.access_token}`,
+        "User-Agent": "AIIA-Router/1.0"
+      }
+    });
+    if (userRes.ok) {
+      const user = await userRes.json();
+      login = user.login ?? user.email ?? String(user.id ?? "");
+    }
+  } catch {
+    // ignore user lookup failures
+  }
+
+  const connection = saveGithubCopilotConnection(payload, login);
+  return { status: "connected", connection: maskConnection(connection) };
+}
+
+function saveGithubCopilotConnection(tokens, login) {
+  const state = loadState();
+  const expiresAt = tokens.expires_in
+    ? new Date(Date.now() + Number(tokens.expires_in) * 1000).toISOString()
+    : undefined;
+  const sourcePath = login ? `github-copilot-oauth:${login}` : "github-copilot-oauth";
+  const connection = {
+    id: `conn-github-copilot-${Date.now()}`,
+    provider: githubCopilotOAuth.providerId,
+    authType: "oauth",
+    isActive: true,
+    priority: 0,
+    importedAt: new Date().toISOString(),
+    sourcePath,
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt,
+    providerSpecificData: {
+      providerId: githubCopilotOAuth.providerId,
+      clientId: githubCopilotOAuth.clientId,
+      tokenUrl: githubCopilotOAuth.accessTokenUrl,
+      scope: tokens.scope ?? githubCopilotOAuth.scope,
+      account: login
+    }
+  };
+  state.providerConnections = [
+    ...(state.providerConnections ?? []).filter((item) => !(item.provider === connection.provider && item.sourcePath === connection.sourcePath)),
+    connection
+  ];
+  state.providers = state.providers.map((provider) =>
+    provider.id === githubCopilotOAuth.providerId
+      ? { ...provider, auth: "oauth", status: "connected", enabled: true }
+      : provider
+  );
+  saveState(state);
+  return connection;
+}
+
+function readGitHubStatus() {
+  const state = loadState();
+  const connections = (state.providerConnections ?? []).filter((item) => item.provider === "github-copilot" || item.provider === "github");
+  let ghCli = { installed: false, authenticated: false, account: null };
+  try {
+    execSync("gh --version", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    ghCli.installed = true;
+    try {
+      const statusText = execSync("gh auth status", { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      ghCli.authenticated = /Logged in to/i.test(statusText);
+      const accountMatch = statusText.match(/account\s+(\S+)/i);
+      ghCli.account = accountMatch?.[1] ?? null;
+    } catch (error) {
+      const stderr = error.stderr?.toString?.() ?? error.message ?? "";
+      ghCli.authenticated = /Logged in to/i.test(stderr);
+      const accountMatch = stderr.match(/account\s+(\S+)/i);
+      ghCli.account = accountMatch?.[1] ?? null;
+    }
+  } catch {
+    ghCli = { installed: false, authenticated: false, account: null };
+  }
+
+  const repoRoot = __dirname;
+  const isGitRepo = existsSync(join(repoRoot, ".git"));
+  let branch = null;
+  let remote = null;
+  if (isGitRepo) {
+    try {
+      branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      branch = null;
+    }
+    try {
+      remote = execSync("git remote get-url origin", { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      remote = null;
+    }
+  }
+
+  return {
+    connected: connections.length > 0,
+    connectionCount: connections.length,
+    accounts: connections.map((item) => item.providerSpecificData?.account ?? item.sourcePath),
+    ghCli,
+    repository: { isGitRepo, branch, remote }
+  };
 }
 
 const oauthDiscoveryTargets = [
@@ -315,6 +742,11 @@ function loadState() {
     providers: mergeById(defaults.providers, saved.providers),
     combos: ensureBuiltinFallback(mergeById(defaults.combos, saved.combos)),
     providerConnections: saved.providerConnections ?? defaults.providerConnections,
+    connectionRotation: { ...defaults.connectionRotation, ...(saved.connectionRotation ?? {}) },
+    providerConnectionSettings: {
+      ...defaults.providerConnectionSettings,
+      ...(saved.providerConnectionSettings ?? {})
+    },
     aliases: { ...defaults.aliases, ...(saved.aliases ?? {}) }
   };
 }
@@ -366,11 +798,15 @@ function maskKey(key = "") {
 
 function maskConnection(connection) {
   const { accessToken: _accessToken, refreshToken: _refreshToken, ...safe } = connection;
+  const inCooldown = isConnectionInCooldown(connection);
   return {
     ...safe,
     hasAccessToken: Boolean(connection.accessToken),
     hasRefreshToken: Boolean(connection.refreshToken),
-    accessTokenPreview: connection.accessToken ? maskKey(connection.accessToken) : undefined
+    accessTokenPreview: connection.accessToken ? maskKey(connection.accessToken) : undefined,
+    cooldownUntil: connection.cooldownUntil,
+    lastError: connection.lastError,
+    inCooldown
   };
 }
 
@@ -383,7 +819,7 @@ function routeCandidates(state, requestedModel) {
       const [providerId, ...modelParts] = entry.split("/");
       const provider = state.providers.find((item) => item.id === providerId);
       if (!provider) return null;
-      return { provider, model: modelParts.join("/") || provider.model, connection: selectConnection(state, provider.id) };
+      return { provider, model: modelParts.join("/") || provider.model };
     })
     .filter(Boolean)
     .filter(({ provider }) => provider.enabled && provider.status !== "needs-key" && provider.quota > 0);
@@ -393,10 +829,130 @@ function routeCandidates(state, requestedModel) {
   return candidates.sort((a, b) => order.indexOf(a.provider.tier) - order.indexOf(b.provider.tier));
 }
 
-function selectConnection(state, providerId) {
+function selectConnections(state, providerId) {
   return (state.providerConnections ?? [])
     .filter((connection) => connection.provider === providerId && connection.isActive !== false)
-    .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100))[0];
+    .sort((a, b) => (a.priority ?? 100) - (b.priority ?? 100));
+}
+
+function isConnectionInCooldown(connection) {
+  if (!connection?.cooldownUntil) return false;
+  return new Date(connection.cooldownUntil).getTime() > Date.now();
+}
+
+function filterAvailableConnections(connections, excludeIds = new Set()) {
+  return connections.filter((connection) => !excludeIds.has(connection.id) && !isConnectionInCooldown(connection));
+}
+
+function isRoundRobinEnabled(state, providerId) {
+  const settings = state.providerConnectionSettings?.[providerId];
+  if (settings?.roundRobin !== undefined) return settings.roundRobin;
+  const provider = state.providers.find((item) => item.id === providerId);
+  return provider?.auth === "oauth";
+}
+
+function orderConnectionsForDispatch(state, providerId, excludeIds = new Set()) {
+  const available = filterAvailableConnections(selectConnections(state, providerId), excludeIds);
+  if (!available.length) return [];
+  if (!isRoundRobinEnabled(state, providerId) || available.length === 1) return available;
+  const rotation = state.connectionRotation?.[providerId] ?? 0;
+  const start = rotation % available.length;
+  return [...available.slice(start), ...available.slice(0, start)];
+}
+
+function selectConnection(state, providerId, options = {}) {
+  const excludeIds = options.excludeIds instanceof Set ? options.excludeIds : new Set(options.excludeIds ?? []);
+  const ordered = orderConnectionsForDispatch(state, providerId, excludeIds);
+  return ordered[0] ?? null;
+}
+
+function advanceConnectionRotation(state, providerId, connectionId) {
+  const available = filterAvailableConnections(selectConnections(state, providerId));
+  if (available.length <= 1) return;
+  const index = available.findIndex((connection) => connection.id === connectionId);
+  if (index < 0) return;
+  state.connectionRotation = {
+    ...(state.connectionRotation ?? {}),
+    [providerId]: (index + 1) % available.length
+  };
+  saveState(state);
+}
+
+function isRateLimitError(status, bodyText = "") {
+  const lower = String(bodyText).toLowerCase();
+  if (status === 429) return true;
+  return (
+    lower.includes("rate_limit") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("quota exceeded") ||
+    lower.includes("quota_exceeded") ||
+    lower.includes("resource_exhausted")
+  );
+}
+
+function isFallbackEligibleError(status, bodyText = "") {
+  if (isRateLimitError(status, bodyText)) return true;
+  if ([401, 402, 403].includes(status)) return true;
+  const lower = String(bodyText).toLowerCase();
+  return lower.includes("overloaded") || lower.includes("capacity");
+}
+
+function parseRetryAfterMs(response, bodyText = "") {
+  const header = response?.headers?.get?.("retry-after");
+  if (header) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) return Date.now() + seconds * 1000;
+    const dateMs = Date.parse(header);
+    if (Number.isFinite(dateMs)) return dateMs;
+  }
+  try {
+    const json = JSON.parse(bodyText);
+    const retry = json?.error?.retry_after ?? json?.retry_after ?? json?.retryAfter;
+    if (Number.isFinite(retry) && retry >= 0) return Date.now() + retry * 1000;
+    const resetAt = json?.error?.resets_at ?? json?.resets_at ?? json?.resetsAt;
+    if (resetAt) {
+      const resetMs = typeof resetAt === "number" ? resetAt : Date.parse(resetAt);
+      if (Number.isFinite(resetMs) && resetMs > Date.now()) return resetMs;
+    }
+  } catch {
+    // ignore non-json bodies
+  }
+  return null;
+}
+
+function defaultCooldownMs(status, bodyText = "", connection) {
+  if (isRateLimitError(status, bodyText)) {
+    const level = connection?.backoffLevel ?? 0;
+    const nextLevel = Math.min(level + 1, 15);
+    const cooldown = 2000 * 2 ** Math.max(0, nextLevel - 1);
+    return { cooldownMs: Math.min(cooldown, 5 * 60 * 1000), backoffLevel: nextLevel };
+  }
+  if ([401, 402, 403].includes(status)) return { cooldownMs: 2 * 60 * 1000, backoffLevel: connection?.backoffLevel ?? 0 };
+  return { cooldownMs: 30 * 1000, backoffLevel: connection?.backoffLevel ?? 0 };
+}
+
+function markConnectionCooldown(state, connectionId, untilMs, reason, backoffLevel) {
+  state.providerConnections = state.providerConnections.map((connection) =>
+    connection.id === connectionId
+      ? {
+          ...connection,
+          cooldownUntil: new Date(untilMs).toISOString(),
+          lastError: typeof reason === "string" ? reason.slice(0, 200) : String(reason ?? "provider error").slice(0, 200),
+          backoffLevel: backoffLevel ?? connection.backoffLevel ?? 0
+        }
+      : connection
+  );
+  saveState(state);
+}
+
+function clearConnectionCooldown(state, connectionId) {
+  state.providerConnections = state.providerConnections.map((connection) =>
+    connection.id === connectionId
+      ? { ...connection, cooldownUntil: undefined, lastError: undefined, backoffLevel: 0 }
+      : connection
+  );
+  saveState(state);
 }
 
 function compactToolOutput(messages) {
@@ -733,29 +1289,79 @@ async function dispatch(body) {
   const attempts = [];
 
   for (const candidate of routeCandidates(state, normalized.model)) {
-    let { provider, model, connection } = candidate;
-    try {
-      if (provider.type === "builtin") {
-        return { json: builtinCompletion(normalized, model), provider, model, attempts };
+    const { provider, model } = candidate;
+
+    if (provider.type === "builtin") {
+      return { json: builtinCompletion(normalized, model), provider, model, attempts };
+    }
+
+    const connectionsToTry = orderConnectionsForDispatch(state, provider.id);
+    const hasEnvKey = Boolean(process.env[provider.apiKeyEnv]);
+    const canUseEnvKey = hasEnvKey || provider.auth === "none" || provider.baseUrl.includes("127.0.0.1");
+    const attemptTargets = connectionsToTry.length ? connectionsToTry : canUseEnvKey ? [null] : [];
+
+    if (!attemptTargets.length) {
+      attempts.push({ provider: provider.id, model, error: "No available connections" });
+      continue;
+    }
+
+    for (const connection of attemptTargets) {
+      try {
+        let activeConnection = connection ? await refreshConnectionIfNeeded(state, connection) : connection;
+        if (!activeConnection?.accessToken && !canUseEnvKey) {
+          throw new Error(`Missing ${provider.apiKeyEnv}`);
+        }
+        const payload = toProviderPayload(provider, normalized, model, state);
+        const response = await fetch(providerUrl(provider, model, normalized.stream), {
+          method: "POST",
+          headers: providerHeaders(provider, activeConnection),
+          body: JSON.stringify(payload)
+        });
+        if (!response.ok) {
+          const bodyText = await response.text();
+          if (activeConnection?.id && isFallbackEligibleError(response.status, bodyText)) {
+            const retryAfterMs = parseRetryAfterMs(response, bodyText);
+            const { cooldownMs, backoffLevel } = defaultCooldownMs(response.status, bodyText, activeConnection);
+            const untilMs = retryAfterMs ?? Date.now() + cooldownMs;
+            markConnectionCooldown(state, activeConnection.id, untilMs, bodyText, backoffLevel);
+            attempts.push({
+              provider: provider.id,
+              model,
+              connectionId: activeConnection.id,
+              error: `${response.status} ${bodyText.slice(0, 120)}`
+            });
+            continue;
+          }
+          throw new Error(`${response.status} ${bodyText}`);
+        }
+
+        if (activeConnection?.id) {
+          clearConnectionCooldown(state, activeConnection.id);
+          advanceConnectionRotation(state, provider.id, activeConnection.id);
+        }
+
+        if (normalized.stream) {
+          return { stream: response.body, provider, model, attempts, connectionId: activeConnection?.id };
+        }
+        const json = await response.json();
+        return {
+          json: toOpenAiResponse(provider, json, model),
+          provider,
+          model,
+          attempts,
+          connectionId: activeConnection?.id
+        };
+      } catch (error) {
+        attempts.push({
+          provider: provider.id,
+          model,
+          connectionId: connection?.id,
+          error: error.message
+        });
       }
-      connection = await refreshConnectionIfNeeded(state, connection);
-      if (!connection?.accessToken && !process.env[provider.apiKeyEnv] && provider.auth !== "none" && !provider.baseUrl.includes("127.0.0.1")) {
-        throw new Error(`Missing ${provider.apiKeyEnv}`);
-      }
-      const payload = toProviderPayload(provider, normalized, model, state);
-      const response = await fetch(providerUrl(provider, model, normalized.stream), {
-        method: "POST",
-        headers: providerHeaders(provider, connection),
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
-      if (normalized.stream) return { stream: response.body, provider, model, attempts };
-      const json = await response.json();
-      return { json: toOpenAiResponse(provider, json, model), provider, model, attempts };
-    } catch (error) {
-      attempts.push({ provider: provider.id, model, error: error.message });
     }
   }
+
   const error = new Error("All providers failed");
   error.attempts = attempts;
   throw error;
@@ -828,23 +1434,157 @@ app.post("/api/providers/:id/test", async (req, res) => {
   res.status(validation.ok ? 200 : 422).json(validation);
 });
 
-app.get("/api/oauth/claude-code/authorize", (_req, res) => {
-  const { url, state } = createClaudeCodeAuthorizeUrl();
-  res.json({ url, state, redirectUri: claudeCodeRedirectUri() });
+function sendClaudeCodeAuthorize(req, res) {
+  const redirectUri = req.query.redirect_uri ? String(req.query.redirect_uri) : undefined;
+  res.json(claudeCodeAuthorizePayload(redirectUri));
+}
+
+async function completeClaudeCodeOAuth({ callbackUrl, code, state, redirectUri, codeVerifier }) {
+  let authCode = code;
+  let authState = state;
+  if (callbackUrl) {
+    const parsed = new URL(String(callbackUrl).trim());
+    authCode = parsed.searchParams.get("code");
+    authState = parsed.searchParams.get("state");
+    const oauthError = parsed.searchParams.get("error");
+    if (oauthError) {
+      const error = new Error(parsed.searchParams.get("error_description") ?? oauthError);
+      error.status = 400;
+      throw error;
+    }
+  }
+  if (!authCode || !authState) {
+    const error = new Error("Authorization code and state are required");
+    error.status = 400;
+    throw error;
+  }
+  const tokens = await exchangeClaudeCodeAuthorizationCode(authCode, authState, codeVerifier, redirectUri);
+  return saveClaudeCodeConnection(tokens);
+}
+
+async function completeAntigravityOAuth({ callbackUrl, code, redirectUri }) {
+  let authCode = code;
+  if (callbackUrl) {
+    const parsed = new URL(String(callbackUrl).trim());
+    authCode = parsed.searchParams.get("code");
+    const oauthError = parsed.searchParams.get("error");
+    if (oauthError) {
+      const error = new Error(parsed.searchParams.get("error_description") ?? oauthError);
+      error.status = 400;
+      throw error;
+    }
+  }
+  if (!authCode) {
+    const error = new Error("Authorization code is required");
+    error.status = 400;
+    throw error;
+  }
+  const tokens = await exchangeAntigravityAuthorizationCode(authCode, redirectUri);
+  const extra = await enrichAntigravityTokens(tokens);
+  return saveAntigravityConnection(tokens, extra);
+}
+
+function sendAntigravityAuthorize(req, res) {
+  const redirectUri = req.query.redirect_uri ? String(req.query.redirect_uri) : undefined;
+  res.json(antigravityAuthorizePayload(redirectUri));
+}
+
+app.get("/api/oauth/claude-code/authorize", sendClaudeCodeAuthorize);
+app.get("/api/oauth/claude/authorize", sendClaudeCodeAuthorize);
+
+app.post("/api/oauth/claude-code/complete", async (req, res) => {
+  try {
+    const connection = await completeClaudeCodeOAuth(req.body ?? {});
+    res.status(201).json(maskConnection(connection));
+  } catch (error) {
+    res.status(error.status ?? 500).json({ error: { message: error.message } });
+  }
+});
+
+app.post("/api/oauth/claude/exchange", async (req, res) => {
+  try {
+    const connection = await completeClaudeCodeOAuth(req.body ?? {});
+    res.status(201).json(maskConnection(connection));
+  } catch (error) {
+    res.status(error.status ?? 500).json({ error: { message: error.message } });
+  }
+});
+
+app.get("/api/oauth/antigravity/authorize", sendAntigravityAuthorize);
+
+app.get("/api/oauth/github-copilot/authorize", async (_req, res) => {
+  try {
+    res.json(await startGithubCopilotDeviceFlow());
+  } catch (error) {
+    res.status(error.status ?? 500).json({ error: { message: error.message } });
+  }
+});
+
+app.post("/api/oauth/github-copilot/poll", async (req, res) => {
+  try {
+    const state = String(req.body?.state ?? "");
+    if (!state) {
+      return res.status(400).json({ error: { message: "state is required" } });
+    }
+    res.json(await pollGithubCopilotDeviceOnce(state));
+  } catch (error) {
+    res.status(error.status ?? 500).json({ error: { message: error.message } });
+  }
+});
+
+app.post("/api/oauth/github-copilot/exchange", async (req, res) => {
+  try {
+    const state = String(req.body?.state ?? "");
+    if (!state) {
+      return res.status(400).json({ error: { message: "state is required" } });
+    }
+    const result = await pollGithubCopilotDeviceOnce(state);
+    if (result.status !== "connected") {
+      return res.status(202).json(result);
+    }
+    res.status(201).json(result.connection);
+  } catch (error) {
+    res.status(error.status ?? 500).json({ error: { message: error.message } });
+  }
+});
+
+app.get("/api/github/status", (_req, res) => {
+  res.json(readGitHubStatus());
+});
+
+app.post("/api/oauth/antigravity/exchange", async (req, res) => {
+  try {
+    const connection = await completeAntigravityOAuth(req.body ?? {});
+    res.status(201).json(maskConnection(connection));
+  } catch (error) {
+    res.status(error.status ?? 500).json({ error: { message: error.message } });
+  }
 });
 
 app.get("/callback", async (req, res) => {
   const { code, state, error, error_description: errorDescription } = req.query;
   if (error) {
-    return res.status(400).send(`<html><body style="font-family:sans-serif;padding:24px"><h1>Claude Code sign-in failed</h1><p>${errorDescription ?? error}</p></body></html>`);
+    return res.status(400).send(`<html><body style="font-family:sans-serif;padding:24px"><h1>OAuth sign-in failed</h1><p>${errorDescription ?? error}</p></body></html>`);
   }
   if (!code || !state) {
     return res.status(400).send("<html><body style=\"font-family:sans-serif;padding:24px\"><h1>Missing OAuth code</h1><p>Return to Provider Settings and try again.</p></body></html>");
   }
+  const pending = loadPendingOAuth();
+  const session = pending[String(state)];
+  const providerKind = session?.provider ?? "claude";
+  const title = providerKind === "antigravity" ? "Antigravity" : "Claude Code";
   try {
-    const tokens = await exchangeClaudeCodeAuthorizationCode(String(code), String(state));
-    saveClaudeCodeConnection(tokens);
-    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:24px;max-width:520px"><h1>Claude Code connected</h1><p>You can close this tab and return to AIIA Provider Settings.</p><script>setTimeout(() => window.close(), 1200)</script></body></html>`);
+    if (providerKind === "antigravity") {
+      const tokens = await exchangeAntigravityAuthorizationCode(String(code));
+      const extra = await enrichAntigravityTokens(tokens);
+      saveAntigravityConnection(tokens, extra);
+    } else {
+      const tokens = await exchangeClaudeCodeAuthorizationCode(String(code), String(state));
+      saveClaudeCodeConnection(tokens);
+    }
+    delete pending[String(state)];
+    savePendingOAuth(pending);
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:24px;max-width:520px"><h1>${title} connected</h1><p>You can close this tab and return to AIIA Provider Settings.</p><script>setTimeout(() => window.close(), 1200)</script></body></html>`);
   } catch (exchangeError) {
     res.status(exchangeError.status ?? 500).send(`<html><body style="font-family:sans-serif;padding:24px"><h1>Token exchange failed</h1><p>${exchangeError.message}</p></body></html>`);
   }
@@ -883,6 +1623,21 @@ app.post("/api/oauth/apply-discovery", (_req, res) => {
 
 app.get("/api/provider-connections", (_req, res) => {
   res.json((loadState().providerConnections ?? []).map(maskConnection));
+});
+
+app.get("/api/provider-connections/settings", (_req, res) => {
+  const state = loadState();
+  res.json(state.providerConnectionSettings ?? {});
+});
+
+app.put("/api/provider-connections/settings", (req, res) => {
+  const state = loadState();
+  state.providerConnectionSettings = {
+    ...(state.providerConnectionSettings ?? {}),
+    ...(req.body ?? {})
+  };
+  saveState(state);
+  res.json(state.providerConnectionSettings);
 });
 
 app.post("/api/oauth/import-local/:provider", (req, res) => {
@@ -936,10 +1691,12 @@ app.get("/api/parity/status", (_req, res) => {
     providerConnections: (state.providerConnections ?? []).length,
     oauthDiscovery: true,
     oauthImport: true,
+    githubOAuth: true,
+    githubStatus: true,
     tokenRefresh: "generic-refresh-token-flow",
     mitm: false,
     usageTracking: false,
-    cooldownEngine: false
+    cooldownEngine: true
   });
 });
 
@@ -1010,6 +1767,7 @@ app.post("/v1/chat/completions", requireKey, async (req, res) => {
     const result = await dispatch(req.body);
     res.setHeader("x-aiia-provider", result.provider.id);
     res.setHeader("x-aiia-model", result.model);
+    if (result.connectionId) res.setHeader("x-aiia-connection", result.connectionId);
     if (result.stream) {
       res.setHeader("content-type", "text/event-stream");
       return result.stream.pipeTo(
@@ -1034,6 +1792,7 @@ app.post("/v1/responses", requireKey, async (req, res) => {
     const result = await dispatch(req.body);
     res.setHeader("x-aiia-provider", result.provider.id);
     res.setHeader("x-aiia-model", result.model);
+    if (result.connectionId) res.setHeader("x-aiia-connection", result.connectionId);
     res.json(toResponsesResponse(result.json));
   } catch (error) {
     res.status(502).json({ error: { message: error.message, attempts: error.attempts ?? [] } });
